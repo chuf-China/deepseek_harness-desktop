@@ -1,0 +1,52 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 桌面壳（Electron）：启动本地 dsh，开窗口指向其 web UI，系统托盘，退出回收子进程。壳核分离，内核不 vendor。",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "cd node_modules/koffi && node ./cnoke.cjs -P . -D src/koffi --prebuild --release",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.deepseekharness.desktop",
+    "productName": "DeepSeek Harness",
+    "asar": false,
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist"
+    },
+    "extraResources": [
+      {
+        "from": "node_modules/@deepseek-ai",
+        "to": "app/node_modules/@deepseek-ai"
+      }
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "author": "DeepSeek Harness Desktop Contributors",
+  "license": "MIT"
+}
