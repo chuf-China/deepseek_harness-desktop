@@ -687,15 +687,32 @@ async function runUpdate({ projectDir, upgradeDsh }) {
   return { ok: true, autoInstall: true };
 }
 
-// 由分离的 PowerShell 助手执行：等应用退出并解锁后静默安装新包，随后自动重启。
+// 由分离的 PowerShell 助手执行（根本性修复 v0.1.3）：
+// 不再依赖 electron-builder 的"旧卸载器"流程——旧卸载器在本机反复非零退出
+// （安装器 exit 2 / 重试后弹"无法关闭"），其依赖（注册表状态、进程彻底死透、
+// 无残留锁文件）任一不满足就失败。改为彻底清理后全新安装：
+//   杀全部进程（含逃逸的 dsh node）→ 删安装目录 → 清注册表 → 静默装新版 → 自动重启。
+// 与手动修复脚本 fix-install-v2 同逻辑（已实测通过）；安装器面对全新状态，
+// 不会触发"卸载旧版"路径，"无法关闭 / exit 2" 结构性消失。
 function installAndQuit(installer) {
   const exe = installedExePath();
+  const dir = exe ? path.dirname(exe) : path.join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness');
+  const newExe = path.join(dir, 'DeepSeek Harness.exe');
   const q = (s) => (s || '').replace(/'/g, "''");
   const ps = [
     'Start-Sleep -Seconds 6',
-    "Start-Process -FilePath '" + q(installer) + "' -ArgumentList '/S'",
-    'Start-Sleep -Seconds 25',
-    "if (Test-Path '" + q(exe) + "') { Start-Process -FilePath '" + q(exe) + "' }",
+    // 路径级强杀：杀掉所有运行在安装目录里的进程（主进程/渲染/dsh node 全覆盖）。
+    // 不用 taskkill /t /im —— 助手自身是应用的后代进程，/t 会把助手一起杀掉。
+    `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    'Start-Sleep -Seconds 3',
+    `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
+    // 目录没删掉就中止（避免半新半旧混装），重新拉起旧版并退出
+    `if (Test-Path '${q(dir)}') { Start-Process -FilePath '${q(newExe)}'; exit 1 }`,
+    "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force } } catch {} } }",
+    `Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
+    '$deadline = (Get-Date).AddMinutes(3)',
+    `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }`,
+    `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' }`,
   ].join('\n');
   const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
     detached: true,
@@ -703,7 +720,7 @@ function installAndQuit(installer) {
     windowsHide: true,
   });
   child.unref();
-  // 稍等片刻让用户看到日志，再真正退出（助手会等待 exe 解锁后安装）
+  // 稍等片刻让用户看到日志，再真正退出（助手会等应用退出后执行清理与安装）
   setTimeout(() => {
     quitting = true;
     stopDsh();
@@ -721,6 +738,7 @@ ipcMain.handle('settings:run-update', (_e, args) => runUpdate(args || {}));
 /* ------------------------------------------------------------------ */
 
 let autoUpdater = null;
+let downloadedInstallerPath = null; // update-downloaded 事件记录的安装器路径（干净安装用）
 try {
   const { autoUpdater: au } = require('electron-updater');
   autoUpdater = au;
@@ -736,7 +754,12 @@ try {
     const pct = p && p.percent != null ? p.percent.toFixed(1) : '?';
     sendUpdateLog('[更新] 下载中… ' + pct + '%（' + mb(p && p.transferred) + ' / ' + mb(p && p.total) + ' MB）');
   });
-  autoUpdater.on('update-downloaded', () => sendUpdateLog('[更新] 新版本下载完成。'));
+  autoUpdater.on('update-downloaded', (info) => {
+    // 记录下载好的安装器路径：update:quit-install 用它走"干净状态静默安装"（根本性修复，
+    // 绕开 electron-builder 的旧卸载器流程，见 installAndQuit）。
+    if (info && info.downloadedFile) downloadedInstallerPath = info.downloadedFile;
+    sendUpdateLog('[更新] 新版本下载完成。' + (downloadedInstallerPath ? '（' + downloadedInstallerPath + '）' : ''));
+  });
   autoUpdater.on('error', (e) => sendUpdateLog('[更新][updater][ERR] ' + ((e && e.message) || String(e))));
 } catch { autoUpdater = null; }
 
@@ -792,9 +815,16 @@ ipcMain.handle('update:download', async () => {
 });
 
 ipcMain.handle('update:quit-install', () => {
+  // 根本性修复：优先走"干净状态静默安装"（installAndQuit：杀进程→删目录→清注册表→
+  // 装新版→重启），彻底绕开 electron-updater 的 quitAndInstall 及其触发的旧卸载器
+  // 流程（旧卸载器失败 → exit 2 / "无法关闭"）。
+  if (downloadedInstallerPath && fs.existsSync(downloadedInstallerPath)) {
+    installAndQuit(downloadedInstallerPath);
+    return { ok: true, mode: 'clean-install' };
+  }
   if (!autoUpdater) return { ok: false, error: 'electron-updater 未加载' };
   autoUpdater.quitAndInstall();
-  return { ok: true };
+  return { ok: true, mode: 'updater' };
 });
 
 // 内核主题同步：web 页面报告实际主题（深/浅），让 Windows 标题栏等原生 UI 跟随，
