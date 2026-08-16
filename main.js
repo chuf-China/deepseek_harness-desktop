@@ -724,11 +724,19 @@ function installAndQuit(installer) {
     `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }; "after wait: newExeExists=$(Test-Path '${q(newExe)}')" | Out-File $LOG -Append -Encoding utf8`,
     `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' } else { Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
   ].join('\r\n');
-  // 写临时 .ps1 文件，用 -File 执行（-Command 多行传参在真实 spawn 下会被破坏）
+  // v0.1.7 关键修正：不能用 spawn detached:true 直接起 powershell——实测 detached 在
+  // Windows 上会让 powershell 启动即退（-Command 与 -File 都一样，连 Write-Output 都不执行）。
+  // 正确姿势：写一个 .cmd 批处理（CRLF），内部用 `start "" /min powershell.exe -File ...`，
+  // 由 cmd 的 start 把 powershell 完全脱离父进程；父进程（应用）退出后它继续跑。
+  // 写临时 .ps1 文件
   const ps1 = path.join(process.env.TEMP || '.', 'dsh-install.ps1');
   try { fs.writeFileSync(ps1, ps, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e))); }
-  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1], {
-    detached: true,
+  // 写临时 .cmd 批处理（必须 CRLF，LF 会被 cmd 解析破坏）
+  const cmdPath = path.join(process.env.TEMP || '.', 'dsh-install.cmd');
+  const cmdBody = '@echo off\r\nstart "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ps1 + '"\r\n';
+  try { fs.writeFileSync(cmdPath, cmdBody, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装批处理失败：' + ((e && e.message) || String(e))); }
+  const child = spawn('cmd.exe', ['/c', cmdPath], {
+    // 注意：不要 detached:true（会让 powershell 启动即死）；cmd /c start 已实现脱离
     stdio: 'ignore',
     windowsHide: true,
   });
