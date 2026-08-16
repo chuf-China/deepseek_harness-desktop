@@ -4,3 +4,6 @@ out/
 *.log
 .DS_Store
 node/
+
+# Windows Packet Monitor logs
+PktMon.*

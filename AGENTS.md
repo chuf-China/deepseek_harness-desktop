@@ -28,6 +28,9 @@ main.js (Electron 主进程)
   ├─ dsh 崩溃自动重启：exit 且非主动退出 → handleDshCrash() 退避重试（1s~5s，
   │    最多 5 次；连续稳定 30s 后重置计数；超限弹框退出）；托盘气泡提示；
   │    waitForReady 用 isDead 回调感知"就绪前崩溃"避免双重重启
+  ├─ skills.js：技能面板数据服务（壳侧）——扫描与内核 dsh-skill-filesystem 相同的
+  │    技能根目录、读写 SKILL.md，注册 skills:* IPC；preload 在设置弹窗注入
+  │    「技能」卡片；内核 Chokidar 监听技能根，面板改动被会话实时感知
   └─ 退出：Windows 用 taskkill /pid <dsh> /T /F 回收整棵子进程树
 ```
 
@@ -78,7 +81,8 @@ npm run dist
 | 文件/目录 | 作用 |
 |---|---|
 | `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新（双通道） |
-| `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：更新卡片注入 + 主题同步 |
+| `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（与内核 `dsh-skill-filesystem` 同一批根目录：项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
+| `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：更新卡片 + 技能卡片注入、`skills` 桥、主题同步 |
 | `assets/` | 托盘与应用图标（`tray.png` 缺失时回退 `icon.png`） |
 | `node/` | 捆绑的标准 node.exe（`extraResources` → `resources/node/node.exe`，随包分发；**git 忽略**，由 `release.cmd` / CI 从系统 node 生成） |
 | `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases） |
@@ -101,6 +105,12 @@ npm run dist
    值带引号 + `--hidden`）；开发模式（`electron .`）禁用该开关。自启/`--hidden`
    启动只驻留托盘不弹窗；此时 dsh 崩溃自动重启照常生效。
 5. **平台**：当前 `build` 只配了 `win/nsis`（Windows），macOS/Linux 未支持。
+6. **技能面板（壳侧）**：只做展示 + 文本编辑，不做每会话启停开关（调用策略由
+   SKILL.md frontmatter 控制，面板仅展示模型/用户徽标）；新建默认落用户根
+   `~/.dsh/skills`（项目根同名技能会覆盖它，面板按根展示）；frontmatter 解析为
+   极简实现，语义以内核 `dsh-skill-filesystem` README 为准（非法策略值 → 面板
+   标 invalid，与内核"丢弃该技能"对齐）；实时感知依赖内核 Chokidar watcher，
+   极端未触发时面板可手动「刷新」。
 
 ## 给 agent 的排查提示
 

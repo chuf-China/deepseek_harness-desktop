@@ -21,6 +21,9 @@ const net = require('node:net');
 const path = require('node:path');
 const fs = require('node:fs');
 
+// 技能面板数据服务（壳侧）：扫描/读写技能文件 + skills:* IPC（见 skills.js）。
+require('./skills');
+
 /** dsh web 就绪探测的总超时（毫秒）。 */
 const READY_TIMEOUT_MS = 120_000;
 

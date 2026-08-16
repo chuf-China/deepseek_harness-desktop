@@ -23,6 +23,13 @@ contextBridge.exposeInMainWorld(
     downloadUpdate: () => ipcRenderer.invoke('update:download'),
     quitAndInstall: () => ipcRenderer.invoke('update:quit-install'),
     applyIcon: () => ipcRenderer.invoke('settings:apply-icon'),
+    skills: {
+      list: () => ipcRenderer.invoke('skills:list'),
+      create: (name, body) => ipcRenderer.invoke('skills:create', name, body),
+      update: (name, body) => ipcRenderer.invoke('skills:update', name, body),
+      delete: (name) => ipcRenderer.invoke('skills:delete', name),
+      openFolder: (name) => ipcRenderer.invoke('skills:open-folder', name),
+    },
     onUpdateLog: (cb) => {
       const listener = (_event, msg) => cb(msg);
       ipcRenderer.on('settings:update-log', listener);
@@ -238,22 +245,373 @@ function isGeneralTabActive(dialog) {
   return (active.textContent || '').trim() === '通用设置';
 }
 
-function ensureUpdateCard() {
+function ensureCards() {
   const dialog = findSettingsDialog();
   if (!dialog) return;
   if (!isGeneralTabActive(dialog)) {
     // 切到其它页签时移除卡片（避免每个页签都出现）
-    const host = dialog.querySelector('[data-dsh-update-card-host]');
-    if (host) host.remove();
+    const u = dialog.querySelector('[data-dsh-update-card-host]');
+    if (u) u.remove();
+    const s = dialog.querySelector('[data-dsh-skills-card-host]');
+    if (s) s.remove();
     return;
   }
   injectUpdateCardInto(dialog);
+  injectSkillsCardInto(dialog);
 }
 
 function startObserver() {
-  const observer = new MutationObserver(() => ensureUpdateCard());
+  const observer = new MutationObserver(() => ensureCards());
   observer.observe(document.documentElement, { childList: true, subtree: true });
-  ensureUpdateCard();
+  ensureCards();
+}
+
+/* ------------------------------------------------------------------ */
+/* 原生设置弹窗注入「技能」卡片（壳侧管理 dsh 技能文件）                  */
+/* 数据走 __DSH_DESKTOP__.skills（skills.js 的 skills:* IPC），扫描/读写  */
+/* 技能文件由主进程完成；内核 Chokidar 监听技能根，改动实时生效。          */
+/* ------------------------------------------------------------------ */
+
+function skillsCardStyle() {
+  return `
+:host { display: block; }
+.skills { margin-top: 4px; }
+.skills .toolbar { display: flex; gap: 8px; align-items: center; margin: 8px 0 2px; }
+.skills .toolbar .hint { flex: auto; font-size: 12px; color: color-mix(in srgb, currentColor 55%, transparent); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skills .skill {
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 12px; padding: 8px 10px; margin: 6px 0;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+.skills .skill.invalid { border-color: color-mix(in srgb, #f2545b 60%, transparent); }
+.skills .head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.skills .name { font-weight: 600; font-size: 14px; color: currentColor; flex: none; }
+.skills .badge {
+  font-size: 11px; padding: 1px 8px; border-radius: 999px; flex: none;
+  background: color-mix(in srgb, #4d6bfe 16%, transparent);
+  color: color-mix(in srgb, currentColor 85%, transparent);
+}
+.skills .badge.none { background: color-mix(in srgb, currentColor 10%, transparent); color: color-mix(in srgb, currentColor 55%, transparent); }
+.skills .root { font-size: 11px; color: color-mix(in srgb, currentColor 50%, transparent); flex: none; }
+.skills .spacer { flex: auto; }
+.skills .mini {
+  appearance: none; border: 0; border-radius: 10px; height: 26px; padding: 0 10px;
+  font-size: 12px; cursor: pointer; flex: none;
+  background: color-mix(in srgb, currentColor 10%, transparent); color: currentColor;
+}
+.skills .mini:hover { background: color-mix(in srgb, currentColor 18%, transparent); }
+.skills .mini.danger { color: #f2545b; }
+.skills .desc { font-size: 12.5px; color: color-mix(in srgb, currentColor 70%, transparent); margin-top: 4px; }
+.skills .when { font-size: 12px; color: color-mix(in srgb, currentColor 52%, transparent); margin-top: 2px; }
+.skills .invalid-note { font-size: 12px; color: #f2545b; margin-top: 4px; }
+.skills .body {
+  margin-top: 6px; padding: 8px 10px; border-radius: 10px; max-height: 180px; overflow: auto;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  font-family: Consolas, "SF Mono", monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  color: color-mix(in srgb, currentColor 78%, transparent);
+}
+.skills .form { margin: 8px 0 4px; padding: 8px 10px; border: 1px solid color-mix(in srgb, currentColor 14%, transparent); border-radius: 12px; }
+.skills .form label { display: block; font-size: 12px; color: color-mix(in srgb, currentColor 60%, transparent); margin: 8px 0 4px; }
+.skills textarea {
+  width: 100%; box-sizing: border-box; min-height: 140px; resize: vertical;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  color: currentColor; border: 0; border-radius: 12px; padding: 10px 12px;
+  font-family: Consolas, "SF Mono", monospace; font-size: 12.5px; line-height: 1.5;
+}
+.skills textarea:focus { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #4d6bfe 55%, transparent); }
+.skills input[type="text"] {
+  width: 100%; box-sizing: border-box;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  color: currentColor; border: 0; border-radius: 18px; height: 36px; padding: 0 14px; font-size: 14px;
+}
+.skills input[type="text"]:focus { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #4d6bfe 55%, transparent); }
+.skills .err { font-size: 12.5px; color: #f2545b; margin-top: 6px; }
+.skills .ok { font-size: 12.5px; color: #34c98e; margin-top: 6px; }
+.skills .empty { font-size: 13px; color: color-mix(in srgb, currentColor 55%, transparent); padding: 12px 0; }
+`;
+}
+
+// 新建技能时预填的完整 SKILL.md 模板（整文件模式；主进程 buildSkillFile 是
+// 纯正文模式的模板，两者并存——body 以 --- 开头时主进程按整文件原样写入）。
+function skillsTemplate(name) {
+  return '---\n' +
+    'name: ' + name + '\n' +
+    'description: 用一句话说明这个技能的用途（会出现在 / 补全和模型技能目录里）\n' +
+    'whenToUse: 在什么情况下模型应该主动调用这个技能\n' +
+    '# disable-model-invocation: false   # true = 模型目录不出现，仅 / 手动调用\n' +
+    '# user-invocable: true              # false = 仅模型可调用，/ 补全不出现\n' +
+    '---\n\n' +
+    '# 技能正文\n\n在这里写具体的操作指引（skill 工具会把全文注入给模型）。\n';
+}
+
+function injectSkillsCardInto(dialog) {
+  if (dialog.querySelector('[data-dsh-skills-card-host]')) return null;
+
+  const host = document.createElement('div');
+  host.setAttribute('data-dsh-skills-card-host', '');
+  const shadow = host.attachShadow({ mode: 'open' });
+
+  const style = document.createElement('style');
+  style.textContent = cardStyle() + skillsCardStyle();
+  shadow.appendChild(style);
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+<div class="card">
+  <h4>技能</h4>
+  <p class="sub">管理 dsh 技能（SKILL.md 文件）——改动会被当前会话实时感知，无需重启</p>
+  <div class="skills">
+    <div class="toolbar">
+      <span class="hint" data-hint>加载中…</span>
+      <button type="button" class="ghost" data-refresh>刷新</button>
+      <button type="button" class="primary" data-new>+ 新建技能</button>
+    </div>
+    <div data-form-wrap></div>
+    <div data-list></div>
+    <div class="log" data-log></div>
+  </div>
+</div>`;
+  shadow.appendChild(wrap);
+
+  const q = (sel) => shadow.querySelector(sel);
+  const hintEl = q('[data-hint]');
+  const listEl = q('[data-list]');
+  const formWrap = q('[data-form-wrap]');
+  const refreshBtn = q('[data-refresh]');
+  const newBtn = q('[data-new]');
+  const logEl = q('[data-log]');
+  // 注意：卡片代码运行在 preload 隔离世界，window.__DSH_DESKTOP__（contextBridge
+  // 暴露给主世界）在这里不可见，必须直接用本作用域的 ipcRenderer。
+  const skills = {
+    list: () => ipcRenderer.invoke('skills:list'),
+    create: (name, body) => ipcRenderer.invoke('skills:create', name, body),
+    update: (name, body) => ipcRenderer.invoke('skills:update', name, body),
+    delete: (name) => ipcRenderer.invoke('skills:delete', name),
+    openFolder: (name) => ipcRenderer.invoke('skills:open-folder', name),
+  };
+
+  let skillsData = null;
+  let listVersion = 0; // 防止快速连续刷新时旧响应覆盖新响应
+
+  const appendLog = (msg, color) => {
+    logEl.classList.add('show');
+    const line = document.createElement('div');
+    line.textContent = msg;
+    if (color) line.style.color = color;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  };
+
+  function badgeOf(s) {
+    if (s.invalid) return { text: '策略异常', cls: 'none' };
+    const m = s.modelInvocable;
+    const u = s.userInvocable;
+    if (m && u) return { text: '模型+用户', cls: '' };
+    if (m) return { text: '仅模型', cls: '' };
+    if (u) return { text: '仅用户', cls: '' };
+    return { text: '已禁用', cls: 'none' };
+  }
+
+  function renderList() {
+    listEl.textContent = '';
+    if (!skillsData || skillsData.skills.length === 0) {
+      listEl.appendChild(el('div', 'empty', '暂无技能——点右上角「+ 新建技能」创建第一个。'));
+      return;
+    }
+    for (const s of skillsData.skills) renderItem(s);
+  }
+
+  function renderItem(s) {
+    const row = el('div', 'skill' + (s.invalid ? ' invalid' : ''));
+    const head = el('div', 'head');
+    head.appendChild(el('span', 'name', s.name));
+    const b = badgeOf(s);
+    head.appendChild(el('span', 'badge' + (b.cls ? ' ' + b.cls : ''), b.text));
+    head.appendChild(el('span', 'root', s.rootLabel));
+    head.appendChild(el('span', 'spacer'));
+    const openBtn = el('button', 'mini', '打开');
+    openBtn.type = 'button';
+    const editBtn = el('button', 'mini', '编辑');
+    editBtn.type = 'button';
+    const delBtn = el('button', 'mini danger', '删除');
+    delBtn.type = 'button';
+    head.appendChild(openBtn);
+    head.appendChild(editBtn);
+    head.appendChild(delBtn);
+    row.appendChild(head);
+
+    if (s.description) row.appendChild(el('div', 'desc', s.description));
+    if (s.whenToUse) row.appendChild(el('div', 'when', '适用：' + s.whenToUse));
+    if (s.invalid) row.appendChild(el('div', 'invalid-note', '⚠ frontmatter 策略字段非法，内核会忽略此技能——请用「编辑」修正。'));
+
+    const bodyPre = el('pre', 'body', (s.fullText || s.body) ? (s.fullText || s.body) : '（正文为空）');
+    bodyPre.hidden = true;
+    row.appendChild(bodyPre);
+
+    // 编辑表单：整文件编辑（frontmatter + 正文），保存后主进程原样 round-trip 写回。
+    const editBox = el('div', 'form');
+    editBox.hidden = true;
+    editBox.appendChild(el('label', '', '编辑 SKILL.md（含 frontmatter，保存后实时生效）'));
+    const ta = document.createElement('textarea');
+    ta.value = s.fullText || s.body || '';
+    editBox.appendChild(ta);
+    const editErr = el('div', 'err');
+    editErr.hidden = true;
+    editBox.appendChild(editErr);
+    const editRow = el('div', 'row');
+    const saveBtn = el('button', 'primary', '保存');
+    saveBtn.type = 'button';
+    const cancelBtn = el('button', 'ghost', '取消');
+    cancelBtn.type = 'button';
+    editRow.appendChild(saveBtn);
+    editRow.appendChild(cancelBtn);
+    editBox.appendChild(editRow);
+    row.appendChild(editBox);
+
+    // 标题行点击展开/收起正文预览
+    head.style.cursor = 'pointer';
+    const toggleBody = () => {
+      bodyPre.hidden = !bodyPre.hidden;
+      if (!bodyPre.hidden) editBox.hidden = true;
+    };
+    head.addEventListener('click', (e) => {
+      if (e.target === openBtn || e.target === editBtn || e.target === delBtn) return;
+      toggleBody();
+    });
+
+    openBtn.addEventListener('click', () => {
+      skills.openFolder(s.name).then((r) => {
+        if (r && !r.ok) appendLog('[ERR] ' + (r.error || '打开失败'), '#f2545b');
+      });
+    });
+
+    editBtn.addEventListener('click', () => {
+      editBox.hidden = !editBox.hidden;
+      if (!editBox.hidden) { bodyPre.hidden = true; editErr.hidden = true; ta.focus(); }
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      editErr.hidden = true;
+      const r = await skills.update(s.name, ta.value);
+      if (r && r.ok) {
+        appendLog('[OK] 已保存：' + s.name, '#34c98e');
+        editBox.hidden = true;
+        await reload();
+      } else {
+        editErr.textContent = (r && r.error) || '保存失败';
+        editErr.hidden = false;
+      }
+      saveBtn.disabled = false;
+    });
+
+    cancelBtn.addEventListener('click', () => { editBox.hidden = true; });
+
+    // 删除：二次确认（按钮变「确认删除?」，3 秒内再点才执行）
+    let delArmed = false;
+    delBtn.addEventListener('click', async () => {
+      if (!delArmed) {
+        delArmed = true;
+        delBtn.textContent = '确认删除?';
+        setTimeout(() => { delArmed = false; delBtn.textContent = '删除'; }, 3000);
+        return;
+      }
+      const r = await skills.delete(s.name);
+      if (r && r.ok) {
+        appendLog('[OK] 已删除：' + s.name, '#34c98e');
+        await reload();
+      } else {
+        appendLog('[ERR] ' + ((r && r.error) || '删除失败'), '#f2545b');
+      }
+    });
+
+    listEl.appendChild(row);
+  }
+
+  function renderNewForm() {
+    formWrap.textContent = '';
+    const form = el('div', 'form');
+    form.appendChild(el('label', '', '技能名（kebab-case，如 my-skill）'));
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'my-skill';
+    form.appendChild(nameInput);
+    form.appendChild(el('label', '', 'SKILL.md 内容（frontmatter + 正文，可改描述/适用时机/策略）'));
+    const ta = document.createElement('textarea');
+    ta.value = skillsTemplate('my-skill');
+    form.appendChild(ta);
+    const err = el('div', 'err');
+    err.hidden = true;
+    form.appendChild(err);
+    const row = el('div', 'row');
+    const createBtn = el('button', 'primary', '创建');
+    createBtn.type = 'button';
+    const cancelBtn = el('button', 'ghost', '取消');
+    cancelBtn.type = 'button';
+    row.appendChild(createBtn);
+    row.appendChild(cancelBtn);
+    form.appendChild(row);
+    formWrap.appendChild(form);
+
+    cancelBtn.addEventListener('click', () => { formWrap.textContent = ''; });
+    createBtn.addEventListener('click', async () => {
+      const name = (nameInput.value || '').trim();
+      if (!name) { err.textContent = '请填写技能名'; err.hidden = false; return; }
+      createBtn.disabled = true;
+      err.hidden = true;
+      const r = await skills.create(name, ta.value);
+      if (r && r.ok) {
+        appendLog('[OK] 已创建：' + name, '#34c98e');
+        formWrap.textContent = '';
+        await reload();
+      } else {
+        err.textContent = (r && r.error) || '创建失败';
+        err.hidden = false;
+        createBtn.disabled = false;
+      }
+    });
+    nameInput.focus();
+  }
+
+  async function reload() {
+    const v = ++listVersion;
+    try {
+      const r = await skills.list();
+      if (v !== listVersion) return; // 已被更新的刷新取代
+      if (r && r.ok) {
+        skillsData = r;
+        const n = (r.skills || []).length;
+        hintEl.textContent =
+          (n ? n + ' 个技能' : '暂无技能') +
+          ' · 新技能创建于 ' + (r.userSkillDir || '');
+        renderList();
+      } else {
+        hintEl.textContent = '加载失败';
+        appendLog('[ERR] ' + ((r && r.error) || '技能列表加载失败'), '#f2545b');
+      }
+    } catch (e) {
+      if (v === listVersion) {
+        hintEl.textContent = '加载失败';
+        appendLog('[ERR] ' + (e && e.message ? e.message : String(e)), '#f2545b');
+      }
+    }
+  }
+
+  refreshBtn.addEventListener('click', () => reload());
+  newBtn.addEventListener('click', renderNewForm);
+
+  reload();
+
+  const container = findOptionsContainer(dialog);
+  container.appendChild(host);
+  return host;
 }
 
 /* ------------------------------------------------------------------ */
