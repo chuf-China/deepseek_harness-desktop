@@ -700,19 +700,25 @@ function installAndQuit(installer) {
   const newExe = path.join(dir, 'DeepSeek Harness.exe');
   const q = (s) => (s || '').replace(/'/g, "''");
   const ps = [
+    // v0.1.4 关键顺序修正：
+    //   1) 先杀进程（路径级，等进程真正消失）——不依赖 taskkill /t /im（助手自身是应用后代进程，/t 会连助手一起杀）
+    //   2) 先清注册表再删目录——注册表清了，安装器就检测不到旧版，走全新安装覆盖，
+    //      永远不会触发 electron-builder 的 uninstallOldVersion（"无法关闭 / exit 2" 的根源）
+    //   3) 删目录失败不再退出——注册表已清 + 进程已死，安装器静默覆盖安装即可成功
     'Start-Sleep -Seconds 6',
-    // 路径级强杀：杀掉所有运行在安装目录里的进程（主进程/渲染/dsh node 全覆盖）。
-    // 不用 taskkill /t /im —— 助手自身是应用的后代进程，/t 会把助手一起杀掉。
     `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    // 轮询等待安装目录进程全部消失（最多 30 秒），避免句柄未释放导致删目录/覆盖失败
+    `for ($w = 0; $w -lt 30; $w++) { $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }; if (-not $left) { break }; Start-Sleep -Seconds 1 }`,
     'Start-Sleep -Seconds 3',
-    `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
-    // 目录没删掉就中止（避免半新半旧混装），重新拉起旧版并退出
-    `if (Test-Path '${q(dir)}') { Start-Process -FilePath '${q(newExe)}'; exit 1 }`,
+    // 先清注册表（关键！放在删目录之前）
     "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force } } catch {} } }",
+    // 删目录：尽力而为（rd /s /q 兜底），失败不中止——安装器会全新覆盖
+    `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
+    `if (Test-Path '${q(dir)}') { cmd /c rd /s /q '${q(dir)}' 2>$null }`,
     `Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
     '$deadline = (Get-Date).AddMinutes(3)',
     `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }`,
-    `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' }`,
+    `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' } else { Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
   ].join('\n');
   const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
     detached: true,
