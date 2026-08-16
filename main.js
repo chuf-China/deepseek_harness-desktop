@@ -705,19 +705,21 @@ function installAndQuit(installer) {
     //   2) 先清注册表再删目录——注册表清了，安装器就检测不到旧版，走全新安装覆盖，
     //      永远不会触发 electron-builder 的 uninstallOldVersion（"无法关闭 / exit 2" 的根源）
     //   3) 删目录失败不再退出——注册表已清 + 进程已死，安装器静默覆盖安装即可成功
+    // 全流程写日志到 %TEMP%\dsh-install.log，任何一步失败都能定位
+    `$LOG = Join-Path $env:TEMP 'dsh-install.log'; "=== installAndQuit $(Get-Date -Format s) installer='${q(installer)}' ===" | Out-File $LOG -Encoding utf8`,
     'Start-Sleep -Seconds 6',
     `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
     // 轮询等待安装目录进程全部消失（最多 30 秒），避免句柄未释放导致删目录/覆盖失败
-    `for ($w = 0; $w -lt 30; $w++) { $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }; if (-not $left) { break }; Start-Sleep -Seconds 1 }`,
+    `for ($w = 0; $w -lt 30; $w++) { $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }; if (-not $left) { break }; Start-Sleep -Seconds 1 }; "after kill: left=$(@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }).Count)" | Out-File $LOG -Append -Encoding utf8`,
     'Start-Sleep -Seconds 3',
     // 先清注册表（关键！放在删目录之前）
-    "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force } } catch {} } }",
+    "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force; Write-Output ('removed-reg: ' + $_.PSPath) | Out-File $LOG -Append -Encoding utf8 } } catch {} } }",
     // 删目录：尽力而为（rd /s /q 兜底），失败不中止——安装器会全新覆盖
     `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
-    `if (Test-Path '${q(dir)}') { cmd /c rd /s /q '${q(dir)}' 2>$null }`,
-    `Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
+    `if (Test-Path '${q(dir)}') { "del-dir-failed, trying rd" | Out-File $LOG -Append -Encoding utf8; cmd /c rd /s /q '${q(dir)}' 2>$null }; "after del: dirExists=$(Test-Path '${q(dir)}')" | Out-File $LOG -Append -Encoding utf8`,
+    `"launching installer" | Out-File $LOG -Append -Encoding utf8; Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
     '$deadline = (Get-Date).AddMinutes(3)',
-    `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }`,
+    `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }; "after wait: newExeExists=$(Test-Path '${q(newExe)}')" | Out-File $LOG -Append -Encoding utf8`,
     `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' } else { Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
   ].join('\n');
   const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
@@ -814,23 +816,41 @@ ipcMain.handle('update:download', async () => {
   if (!autoUpdater) return { ok: false, error: 'electron-updater 未加载' };
   try {
     await autoUpdater.downloadUpdate();
-    return { ok: true };
+    // 不依赖 update-downloaded 事件的时序：直接从 updater 缓存目录兜底定位安装包
+    if (!downloadedInstallerPath) downloadedInstallerPath = findDownloadedInstaller();
+    return { ok: true, installer: downloadedInstallerPath };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e) };
   }
 });
 
+// 从 electron-updater 缓存目录（%LOCALAPPDATA%\deepseek-harness-desktop-updater\pending）
+// 找到最新下载的安装包。彻底摆脱对 update-downloaded 事件时序的依赖
+// （事件若未触发/未赶上，quit-install 不再回退 electron-updater 的 quitAndInstall 旧流程）。
+function findDownloadedInstaller() {
+  try {
+    const cacheDir = path.join(process.env.LOCALAPPDATA || '', 'deepseek-harness-desktop-updater', 'pending');
+    if (!fs.existsSync(cacheDir)) return null;
+    const files = fs.readdirSync(cacheDir).filter((f) => /^DeepSeek-Harness-Setup-.*\.exe$/i.test(f));
+    if (!files.length) return null;
+    files.sort();
+    const p = path.join(cacheDir, files[files.length - 1]);
+    return fs.existsSync(p) ? p : null;
+  } catch { return null; }
+}
+
 ipcMain.handle('update:quit-install', () => {
-  // 根本性修复：优先走"干净状态静默安装"（installAndQuit：杀进程→删目录→清注册表→
+  // 根本性修复：只走"干净状态静默安装"（installAndQuit：杀进程→清注册表→删目录→
   // 装新版→重启），彻底绕开 electron-updater 的 quitAndInstall 及其触发的旧卸载器
-  // 流程（旧卸载器失败 → exit 2 / "无法关闭"）。
-  if (downloadedInstallerPath && fs.existsSync(downloadedInstallerPath)) {
-    installAndQuit(downloadedInstallerPath);
-    return { ok: true, mode: 'clean-install' };
+  // 流程（旧卸载器失败 → exit 2 / "无法关闭"）。找不到安装包就明确报错，绝不回退旧流程。
+  const installer = (downloadedInstallerPath && fs.existsSync(downloadedInstallerPath))
+    ? downloadedInstallerPath
+    : findDownloadedInstaller();
+  if (installer) {
+    installAndQuit(installer);
+    return { ok: true, mode: 'clean-install', installer };
   }
-  if (!autoUpdater) return { ok: false, error: 'electron-updater 未加载' };
-  autoUpdater.quitAndInstall();
-  return { ok: true, mode: 'updater' };
+  return { ok: false, error: '未找到已下载的安装包' };
 });
 
 // 内核主题同步：web 页面报告实际主题（深/浅），让 Windows 标题栏等原生 UI 跟随，
