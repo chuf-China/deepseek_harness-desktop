@@ -9,7 +9,8 @@
     "dist": "electron-builder"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.0-rc.6"
+    "@deepseek-ai/dsh": "^0.1.0-rc.6",
+    "electron-updater": "^6.6.2"
   },
   "devDependencies": {
     "electron": "^35.0.0",
@@ -27,6 +28,10 @@
       {
         "from": "node_modules/@deepseek-ai",
         "to": "app/node_modules/@deepseek-ai"
+      },
+      {
+        "from": "node",
+        "to": "node"
       }
     ],
     "files": [
@@ -48,5 +53,12 @@
     }
   },
   "author": "DeepSeek Harness Desktop Contributors",
-  "license": "MIT"
+  "license": "MIT",
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "chuf-China",
+      "repo": "deepseek_harness-desktop"
+    }
+  ]
 }

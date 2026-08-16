@@ -26,8 +26,8 @@
 
 ## 前置要求
 
-- Node.js >= 18（dsh 是 Node 应用，需 `node` 在 PATH 中）
-- npm
+- 开发模式：Node.js >= 18（dsh 是 Node 应用）+ npm
+- 打包版：**无需装 Node** —— 安装包已捆绑标准 node（`resources/node/node.exe`，与系统 node 同 ABI）
 
 ## 运行（开发模式）
 
@@ -51,10 +51,49 @@ npm run dist
 ```
 
 产物在 `dist/`，默认是 NSIS 安装包（可自选安装目录、建桌面快捷方式）。
+`node/` 目录里的 `node.exe`（标准 node）会随包分发到 `resources/node/`，dsh 由它运行。
 
-> **关键设计**：`build.asar = false`。因为 dsh 是 npm 依赖、壳要用**系统 node**
-> 去 spawn 它，而 asar 是 Electron 私有的虚拟文件系统、系统 node 读不了。关掉
-> asar 后 node_modules 以真实文件存在，系统 node 才能正常执行 dsh。
+> **关键设计**：`build.asar = false`。因为 dsh 是 npm 依赖、壳要用**标准 node**
+> 去 spawn 它，而 asar 是 Electron 私有的虚拟文件系统、标准 node 读不了。关掉
+> asar 后 node_modules 以真实文件存在，node 才能正常执行 dsh。
+
+## 发布与自动更新
+
+设置页（web 原生「通用设置」里的更新卡片）是**双通道一个按钮**：
+
+- **壳通道**：已发布场景走 `electron-updater`（检查 → 下载 → 退出静默安装）；
+- **dsh 内核通道**：npm 上 dsh 有新版时，在本地构建流程里一并升级重打包；
+- 未发布 / 开发模式自动回退“本地构建更新”（`npm run dist` + 自动安装）。
+
+发布到 GitHub Releases 的步骤：
+
+### 一次发布（推荐，CI 全自动）
+
+1. 把代码推到你的 GitHub 仓库（首次先建仓：`git remote add origin <url>`，再
+   `git push -u origin main`）；
+2. 把 `package.json` 的 `publish.owner` / `publish.repo` 改成你的仓库；
+3. 跑 `release.cmd 0.2.0`（自动：版本号 → 本地打包验证 → 提交 → 打 tag → 推送）；
+4. GitHub Actions（`.github/workflows/release.yml`）收到 tag 后自动：打包 →
+   （若配了密钥则）签名 → 上传 Release（`latest.yml` + 安装包）。之后用户点
+   「检查并更新」即可自动升级。
+
+**可选签名**（消除首次安装的 SmartScreen 提示，Azure Trusted Signing 约 $10/月）：
+在仓库 Settings → Secrets and variables → Actions 里加
+`AZURE_ENDPOINT` / `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` /
+`AZURE_ACCOUNT` / `AZURE_CERT_PROFILE`。不配也能发布，只是安装包未签名
+（签名逻辑在 `release-sign.json`，由工作流按需启用）。
+
+### 手动发布（不建 CI 也行）
+
+1. `npm run dist`（配了 publish 后会自动生成 `dist/latest.yml` + 安装包）；
+2. 在 GitHub 仓库 Releases 页新建 Release，tag 用 `vX.Y.Z`；
+3. 上传 `dist/latest.yml` 和 `dist/DeepSeek Harness Setup X.Y.Z.exe`
+   （`.blockmap` 可省略，只影响增量下载）；
+4. 用户端自动更新即可生效。
+
+（可选）不打补丁直接覆盖发布源：在已安装应用的 `resources/` 放
+`update-config.json`，如 `{"provider":"github","owner":"x","repo":"y"}` 或
+`{"provider":"generic","url":"https://your-server/updates/"}`，优先级高于打包时写入的配置。
 
 ## 国内网络提示
 
@@ -69,17 +108,17 @@ npm install
 
 | 文件/目录 | 作用 |
 |---|---|
-| `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收 |
-| `preload.js` | 注入到 dsh 页面的最小只读桥（为原生功能预留） |
-| `assets/` | 托盘与应用图标（占位，可替换成自己的 logo） |
-| `package.json` | 依赖声明 + `build`（electron-builder）配置 |
+| `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新 |
+| `preload.js` | 注入到 dsh 页面的最小只读桥（更新卡片 + 主题同步） |
+| `assets/` | 托盘与应用图标（DeepSeek 鲸鱼 logo：`icon.svg` 为源，`icon.png`/`tray.png`/`icon.ico` 由 `generate-icons.ps1` 生成） |
+| `node/` | 捆绑的标准 node.exe（随包分发，用户无需装 Node） |
+| `package.json` | 依赖声明 + `build`（electron-builder）配置 + `publish`（更新源） |
 | `dist/` | 打包产物（`npm run dist` 生成） |
 
 ## 已知边界（诚实清单）
 
-1. **依赖系统 node**（开发模式和打包版都一样）：壳用系统 `node` 跑 dsh，因为
-   dsh 的 native 依赖（node-pty/koffi）按标准 node ABI 编译。要做到“用户不装
-   Node 也能用”，需后续捆绑标准 Node sidecar。
-2. **未做代码签名 / 自动更新**：Windows 上未签名的安装包会被 SmartScreen 拦，
-   正式分发前需签名；自动更新（壳 + dsh 双通道）也是后续里程碑。
+1. **Node 已捆绑**：打包版用 `resources/node/node.exe` 跑 dsh；仅当捆绑缺失/损坏
+   时才回退系统 node（需 >=18）。开发模式始终用系统 node。
+2. **未做代码签名**：Windows 上未签名的安装包会被 SmartScreen 拦，正式分发前需
+   签名；自动更新（壳 + dsh 双通道）已接入 electron-updater，见上方「发布与自动更新」。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。

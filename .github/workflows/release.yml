@@ -1,0 +1,69 @@
+name: Release (build + sign + publish)
+
+# 推送 v* 标签时自动：打包 →（配置了 Azure 密钥则）签名 → 上传 GitHub Release。
+# 用户端 electron-updater 会自动发现 latest.yml 并提示更新。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 捆绑的标准 node sidecar 不提交进 git（92MB），构建时从 runner 上取
+      - name: Prepare bundled node sidecar (node\node.exe)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path node -Force | Out-Null
+          Copy-Item (Get-Command node).Source node\node.exe -Force
+
+      # 把 package.json publish 里的占位仓库换成当前真实仓库
+      - name: Fill real repo into publish config
+        shell: pwsh
+        run: |
+          $owner, $name = $env:GITHUB_REPOSITORY -split '/'
+          $p = Get-Content package.json -Raw
+          $p = $p -replace '"owner": "your-github-name"', ('"owner": "' + $owner + '"')
+          $p = $p -replace '"repo": "deepseek-harness-desktop"', ('"repo": "' + $name + '"')
+          Set-Content package.json $p -NoNewline
+
+      # 有 Azure Trusted Signing 密钥 → 签名打包并发布
+      - name: Package + publish (signed with Azure Trusted Signing)
+        if: ${{ secrets.AZURE_ENDPOINT != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ACCOUNT: ${{ secrets.AZURE_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+        run: npx electron-builder --publish always --config release-sign.json
+
+      # 未配置签名密钥 → 直接打包并发布（未签名，首次安装会提示 SmartScreen）
+      - name: Package + publish (unsigned)
+        if: ${{ secrets.AZURE_ENDPOINT == '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --publish always
+
+      - name: Show artifacts
+        shell: pwsh
+        run: Get-ChildItem dist | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}

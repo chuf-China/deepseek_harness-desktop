@@ -1,0 +1,14 @@
+{
+  "win": {
+    "azureSignOptions": {
+      "endpoint": "${env.AZURE_ENDPOINT}",
+      "tenantId": "${env.AZURE_TENANT_ID}",
+      "clientId": "${env.AZURE_CLIENT_ID}",
+      "clientSecret": "${env.AZURE_CLIENT_SECRET}",
+      "codeSigningAccountName": "${env.AZURE_ACCOUNT}",
+      "certificateProfileName": "${env.AZURE_CERT_PROFILE}",
+      "timestampRfc3161": "http://timestamp.acs.microsoft.com",
+      "timestampDigest": "sha256"
+    }
+  }
+}
