@@ -700,7 +700,9 @@ function installAndQuit(installer) {
   const newExe = path.join(dir, 'DeepSeek Harness.exe');
   const q = (s) => (s || '').replace(/'/g, "''");
   const ps = [
-    // v0.1.4 关键顺序修正：
+    // v0.1.6 关键修正：不用 -Command 传多行脚本（实测会被 Windows 命令行解析破坏，
+    // 表现为 powershell 启动即退、无任何日志）；改写成临时 .ps1 文件 + -File 执行，
+    // 彻底绕开命令行解析坑。
     //   1) 先杀进程（路径级，等进程真正消失）——不依赖 taskkill /t /im（助手自身是应用后代进程，/t 会连助手一起杀）
     //   2) 先清注册表再删目录——注册表清了，安装器就检测不到旧版，走全新安装覆盖，
     //      永远不会触发 electron-builder 的 uninstallOldVersion（"无法关闭 / exit 2" 的根源）
@@ -721,8 +723,11 @@ function installAndQuit(installer) {
     '$deadline = (Get-Date).AddMinutes(3)',
     `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }; "after wait: newExeExists=$(Test-Path '${q(newExe)}')" | Out-File $LOG -Append -Encoding utf8`,
     `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' } else { Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
-  ].join('\n');
-  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+  ].join('\r\n');
+  // 写临时 .ps1 文件，用 -File 执行（-Command 多行传参在真实 spawn 下会被破坏）
+  const ps1 = path.join(process.env.TEMP || '.', 'dsh-install.ps1');
+  try { fs.writeFileSync(ps1, ps, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e))); }
+  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
