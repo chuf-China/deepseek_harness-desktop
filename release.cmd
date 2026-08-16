@@ -3,8 +3,11 @@ setlocal
 rem One-click release: bump version -> build -> commit -> tag -> push.
 rem CI (GitHub Actions) then builds, signs and uploads the Release automatically.
 rem Usage: release.cmd [new-version, e.g. 0.2.0]   (no arg = keep current version)
+rem NOTE: keep this file pure ASCII (cmd reads .cmd with the ANSI codepage).
 
 set "PROJ=%~dp0"
+rem %~dp0 ends with a backslash, which breaks "path\" quote pairing for git -C
+if "%PROJ:~-1%"=="\" set "PROJ=%PROJ:~0,-1%"
 
 echo ============================================================
 echo   DeepSeek Harness release helper
@@ -17,7 +20,7 @@ if errorlevel 1 (
     echo [ERROR] No git remote "origin" configured.
     echo         Create a GitHub repo first, then:
     echo           git remote add origin https://github.com/YOU/REPO.git
-    goto :end
+    goto :fail
 )
 
 rem ---- ensure bundled node sidecar exists (node\ is gitignored) ----
@@ -26,7 +29,7 @@ echo [1/3] Creating bundled node sidecar from system node...
 where node >nul 2>&1
 if errorlevel 1 (
     echo        [ERROR] system node not found in PATH. Install Node.js ^>= 18 first.
-    goto :end
+    goto :fail
 )
 if not exist "%PROJ%node" mkdir "%PROJ%node"
 for /f "delims=" %%i in ('where node') do if not exist "%PROJ%node\node.exe" copy /y "%%i" "%PROJ%node\node.exe" >nul
@@ -43,7 +46,7 @@ pushd "%PROJ%"
 node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json','utf8'));j.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')" "%NEWVER%"
 set "RC=%ERRORLEVEL%"
 popd
-if not "%RC%"=="0" ( echo        [ERROR] version bump failed & goto :end )
+if not "%RC%"=="0" ( echo        [ERROR] version bump failed & goto :fail )
 goto :after_bump
 :no_bump
 echo [2/3] Keeping current version.
@@ -62,7 +65,7 @@ pushd "%PROJ%"
 call npm.cmd run dist
 set "RC=%ERRORLEVEL%"
 popd
-if not "%RC%"=="0" ( echo        [ERROR] build failed & goto :end )
+if not "%RC%"=="0" ( echo        [ERROR] build failed & goto :fail )
 
 rem ---- commit + tag + push ----
 git -C "%PROJ%" add -A
@@ -70,12 +73,16 @@ git -C "%PROJ%" commit -m "chore: release v%VER%" >nul 2>&1
 git -C "%PROJ%" tag "v%VER%"
 echo Pushing to origin (tag v%VER%)...
 git -C "%PROJ%" push origin HEAD
-if errorlevel 1 ( echo        [ERROR] push failed & goto :end )
+if errorlevel 1 ( echo        [ERROR] push failed & goto :fail )
 git -C "%PROJ%" push origin "v%VER%"
-if errorlevel 1 ( echo        [ERROR] tag push failed & goto :end )
+if errorlevel 1 ( echo        [ERROR] tag push failed & goto :fail )
 
 echo.
 echo Done. GitHub Actions is now building the Release.
 echo Watch it at: https://github.com/  (Actions tab)
 echo.
-:end
+exit /b 0
+:fail
+echo.
+echo [ABORTED] See errors above.
+exit /b 1
