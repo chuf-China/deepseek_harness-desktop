@@ -716,9 +716,15 @@ function installAndQuit(installer) {
     'Start-Sleep -Seconds 3',
     // 先清注册表（关键！放在删目录之前）
     "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force; Write-Output ('removed-reg: ' + $_.PSPath) | Out-File $LOG -Append -Encoding utf8 } } catch {} } }",
-    // 删目录：尽力而为（rd /s /q 兜底），失败不中止——安装器会全新覆盖
+    // 删目录：尽力而为（多轮重试 + rd /s /q 兜底），失败不中止——注册表已清 + 进程已死，
+    // 安装器静默覆盖安装即可成功（v0.1.7 实测：删目录失败但覆盖安装成功）。
+    // 第一轮：10 次 Remove-Item（每次失败等 2 秒）
     `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
-    `if (Test-Path '${q(dir)}') { "del-dir-failed, trying rd" | Out-File $LOG -Append -Encoding utf8; cmd /c rd /s /q '${q(dir)}' 2>$null }; "after del: dirExists=$(Test-Path '${q(dir)}')" | Out-File $LOG -Append -Encoding utf8`,
+    // 第二轮：仍失败则等 5 秒（句柄延迟释放）再重试 5 次
+    `if (Test-Path '${q(dir)}') { "del-dir-failed (pass1), waiting 5s then retry" | Out-File $LOG -Append -Encoding utf8; Start-Sleep -Seconds 5; for ($i = 0; $i -lt 5; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } } }`,
+    // 第三轮：rd /s /q 兜底；并记录仍占用的进程（诊断用，不中止）
+    `if (Test-Path '${q(dir)}') { "del-dir-failed (pass2), trying rd" | Out-File $LOG -Append -Encoding utf8; cmd /c rd /s /q '${q(dir)}' 2>$null }; "after del: dirExists=$(Test-Path '${q(dir)}')" | Out-File $LOG -Append -Encoding utf8`,
+    `$lockers = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }); if ($lockers.Count) { "lockers: " + (($lockers | ForEach-Object { $_.Name + '#' + $_.ProcessId }) -join ', ') | Out-File $LOG -Append -Encoding utf8 }`,
     `"launching installer" | Out-File $LOG -Append -Encoding utf8; Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
     '$deadline = (Get-Date).AddMinutes(3)',
     `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }; "after wait: newExeExists=$(Test-Path '${q(newExe)}')" | Out-File $LOG -Append -Encoding utf8`,
