@@ -52,7 +52,15 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "include": "assets/installer.nsh"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "chuf-China",
+        "repo": "deepseek_harness-desktop",
+        "releaseType": "release"
+      }
+    ]
   },
   "author": "DeepSeek Harness Desktop Contributors",
   "license": "MIT",
