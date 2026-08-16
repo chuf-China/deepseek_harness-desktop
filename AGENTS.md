@@ -31,6 +31,16 @@ main.js (Electron 主进程)
   ├─ skills.js：技能面板数据服务（壳侧）——扫描与内核 dsh-skill-filesystem 相同的
   │    技能根目录、读写 SKILL.md，注册 skills:* IPC；preload 在设置弹窗注入
   │    「技能」卡片；内核 Chokidar 监听技能根，面板改动被会话实时感知
+  ├─ 更新（双通道）：
+  │    ├─ 真实通道：electron-updater（build.publish → GitHub Releases latest.yml）；
+  │    │    update:quit-install → findDownloadedInstaller()（扫 updater 缓存兜底，
+  │    │    不依赖 update-downloaded 事件时序）→ installAndQuit()
+  │    ├─ 本地/开发通道：shellHasChanges()=true（源码与安装目录不同步）→
+  │    │    npm run dist → installAndQuit()
+  │    └─ installAndQuit()：杀进程 → 清注册表 → 删目录(3 段兜底) → 静默装新 →
+  │         重启；起 %TEMP%\dsh-install.ps1（UTF-8 BOM）+ .cmd（CRLF）执行，
+  │         WinForms 进度窗（v0.1.8），成败按安装器退出码判定（详见铁律 #8/#9）
+  ├─ 退出时 exe 图标补丁：spawnExePatch（全文件唯一允许 detached:true 的 spawn）
   └─ 退出：Windows 用 taskkill /pid <dsh> /T /F 回收整棵子进程树
 ```
 
@@ -54,6 +64,26 @@ main.js (Electron 主进程)
 7. **退出必须回收 dsh 子进程树**：Windows 用 `taskkill /pid <pid> /T /F`（主进程
    exit 后 dsh 不会自己死）。区分"主动退出"（`quitting=true`）和"dsh 自己崩了"
    （自动重启，见架构图；重启超限才弹错误框）。
+8. **更新安装助手禁止 `spawn('powershell.exe', …, {detached:true})`**：Windows 下
+   powershell 启动即死（PowerShell 事件日志只有 40961"正在启动"、永远没有 40962
+   "已准备好"）——这是 v0.1.3–v0.1.6 全部"静默安装失败"的根因。必须：把安装脚本
+   写 `%TEMP%\dsh-install.ps1`（**UTF-8 BOM**，中文 UI 文本在 PowerShell 5.1 下
+   才不会乱码；`-Command` 多行会被 cmdline 解析打散，必须用
+   `-File`）+ `%TEMP%\dsh-install.cmd`（**CRLF**，内容
+   `start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ps1>"`），
+   用 `spawn('cmd.exe', ['/c', cmdPath], {stdio:'ignore', windowsHide:true})` 起
+   （**不 detached**，`cmd /c start` 已实现脱离父进程且能跑完）。**全文件唯一允许
+   `detached:true` 的 spawn 是 exe 图标补丁**（`spawnExePatch`，退出后独立完成，
+   别把这条经验扩散到别处）。
+9. **`update:quit-install` 只走 `installAndQuit` 干净状态静默安装**，绝不回退
+   `autoUpdater.quitAndInstall()`（旧流程会触发 old-uninstaller → exit 2 /
+   "无法关闭"死循环）。安装包定位不依赖 `update-downloaded` 事件时序，用
+   `findDownloadedInstaller()` 扫 `%LOCALAPPDATA%\deepseek-harness-desktop-updater\pending\`
+   （文件名排序取最后一个）兜底。installAndQuit 顺序固定：**杀进程 → 清注册表 →
+   删目录 → 装新版 → 重启**；清注册表必须在删目录**之前**（v0.1.4 修正：先清
+   registry 让安装器当全新安装处理，即使删目录失败也不会触发旧卸载器）；成败按
+   安装器退出码判定（`Start-Process -PassThru` + 轮询 `HasExited`，成功 = 退出码
+   0 且新 exe 存在），不是看目录里有没有文件。安装日志写 `%TEMP%\dsh-install.log`。
 
 ## 常用命令
 
@@ -74,20 +104,31 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
 npm install
 $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
 npm run dist
+
+# 一键发布（本地打包校验 → 提交 → 打 tag → 推送；CI 随后自动打包上传 Release）
+release.cmd 0.1.9      # 不带参数 = 保持当前版本只重新发布
+
+# 本地联调"安装进度 UI"全流程：改完 main.js 后
+npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
+# 重启已安装的应用 → 更新卡片显示"本地通道"（shellHasChanges=true）→ 点更新
+# 应用退出后弹出 WinForms 安装进度窗，可观察 杀进程/清注册表/删目录/安装 全过程
 ```
 
 ## 目录速查
 
 | 文件/目录 | 作用 |
 |---|---|
-| `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新（双通道） |
+| `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新（双通道）+ `installAndQuit`（干净静默安装 + WinForms 进度 UI）+ `findDownloadedInstaller`（updater 缓存兜底定位安装包）+ `shellHasChanges`（通道判定） |
 | `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（与内核 `dsh-skill-filesystem` 同一批根目录：项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
 | `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：更新卡片 + 技能卡片注入、`skills` 桥、主题同步 |
-| `assets/` | 托盘与应用图标（`tray.png` 缺失时回退 `icon.png`） |
+| `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏） |
+| `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例，替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑 |
+| `generate-icons.ps1` | 本地工具：从 `icon.svg` 生成各尺寸 png / ico |
+| `update-exe-icon.cmd` | 本地工具：用 rcedit 重打 exe 图标（配合图标补丁逻辑测试） |
 | `node/` | 捆绑的标准 node.exe（`extraResources` → `resources/node/node.exe`，随包分发；**git 忽略**，由 `release.cmd` / CI 从系统 node 生成） |
-| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases） |
-| `.github/workflows/release.yml` | 推 `v*` tag 自动打包 / 可选签名 / 上传 Release（CI 里把 `publish.owner/repo` 占位符换成真实仓库） |
-| `release.cmd` | 一键发布：版本号 → 本地打包 → 提交 → 打 tag → 推送 |
+| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases；owner/repo 已写死真实仓库 `chuf-China/deepseek_harness-desktop`） |
+| `.github/workflows/release.yml` | 推 `v*` tag 自动打包（有 Azure 密钥则签名）并发布 Release（含 `latest.yml` + 安装包 + blockmap）；无密钥则未签名发布。其中"占位符替换"步骤对当前 package.json 已是空操作，保留无害 |
+| `release.cmd` | 一键发布：版本号 → 本地打包校验 → 提交 → 打 tag → 推送（CI 随后自动打包上传） |
 | `release-sign.json` | Azure Trusted Signing 签名配置（仅 CI 有对应 Secrets 时启用） |
 | `dist/` | 打包产物（`npm run dist` 生成） |
 
@@ -95,11 +136,16 @@ npm run dist
 
 1. **Node 已捆绑**：打包版用 `resources/node/node.exe` 跑 dsh；仅当捆绑缺失/损坏时
    回退系统 node（需 >=18）。开发模式始终用系统 node。
-2. **未签名；自动更新已接**：Windows 未签名安装包会被 SmartScreen 拦截，正式分发
-   前需签名。自动更新（壳 + dsh 双通道）已接入 electron-updater：壳通道走
-   `package.json` 的 `publish`（GitHub Releases），未发布/开发模式自动回退本地构建
-   更新（`npm run dist` + 自动安装）。真正发布前需把 `publish.owner/repo` 改成实际
-   仓库并在 Release 上传 `latest.yml` + 安装包。
+2. **未签名；自动更新已接并已发布**：Windows 未签名安装包会被 SmartScreen 拦截，
+   但只影响**手动下载安装包**的场景，应用内自动更新不受影响；正式分发前仍需签名。
+   自动更新（壳 + dsh 双通道）已接入 electron-updater：壳通道走 `package.json` 的
+   `build.publish`（GitHub Releases，owner/repo 已写死真实仓库
+   `chuf-China/deepseek_harness-desktop`，`releaseType: "release"`——顶层 `publish`
+   在构建时被忽略，必须放 `build.publish`，见 452274c）。发布流程 = 推 `v*` tag →
+   CI 自动打包 → 上传 Release（`latest.yml` + 安装包 + blockmap）；当前最新发布
+   **v0.1.8**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
+   （`shellHasChanges()`=true）时回退本地构建更新（`npm run dist` + installAndQuit，
+   同样弹安装进度窗）。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。
 4. **开机自启仅 Windows + 打包版**：托盘"开机自启"直接写 `HKCU\...\Run`（reg.exe，
    值带引号 + `--hidden`）；开发模式（`electron .`）禁用该开关。自启/`--hidden`
@@ -111,6 +157,27 @@ npm run dist
    极简实现，语义以内核 `dsh-skill-filesystem` README 为准（非法策略值 → 面板
    标 invalid，与内核"丢弃该技能"对齐）；实时感知依赖内核 Chokidar watcher，
    极端未触发时面板可手动「刷新」。
+
+## 更新与安装排查要点
+
+- **安装失败第一现场**：`%TEMP%\dsh-install.log`——`installAndQuit` 全程记录每一步
+  （杀进程/清注册表/删目录/安装器退出码），UI 报失败时先看它。
+- **安装包下载缓存**：`%LOCALAPPDATA%\deepseek-harness-desktop-updater\pending\`
+  （`findDownloadedInstaller()` 扫描处；升级下载成功后该目录应有
+  `DeepSeek-Harness-Setup-<ver>.exe`）。
+- **版本验证三件套**：安装目录 `package.json` 的 `version` / exe 文件版本
+  （FileVersion）/ HKCU 卸载注册表 DisplayVersion 三者一致，才是真装上了（历史
+  教训：只信更新卡片文本会误判"没更新"）。
+- **双通道判定**：`shellHasChanges()` 比较源码与安装目录的 main.js、preload.js、
+  assets/icon.ico、icon.png、tray.png、icon.svg 六个文件（**不比** package.json、
+  skills.js）——全同步走真实 GitHub 通道；不同步则更新卡片走本地构建通道
+  （`npm run dist` + installAndQuit）。开发时把源码同步进安装目录可让本地通道
+  变真实通道。
+- **安装器退出码 2 / "无法关闭"** = 旧卸载器流程被触发；正解是先清注册表再删目录
+  （铁律 #9），不是加等待/重试。
+- **"点了更新但没反应"**：先查是否退出后无安装进度窗（= helper 没跑起来，对照
+  铁律 #8 的 spawn 方式），再看 pending 缓存里有没有安装包（= 下载没完成，与安装
+  无关）。
 
 ## 给 agent 的排查提示
 
