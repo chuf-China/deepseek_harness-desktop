@@ -49,7 +49,8 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "include": "assets/installer.nsh"
     }
   },
   "author": "DeepSeek Harness Desktop Contributors",
