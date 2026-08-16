@@ -14,6 +14,15 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 60
+    # secrets 不能直接在 step 的 if: 里引用，统一映射到 job 级 env，if 用 env.* 判断
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_ACCOUNT: ${{ secrets.AZURE_ACCOUNT }}
+      AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,24 +53,14 @@ jobs:
 
       # 有 Azure Trusted Signing 密钥 → 签名打包并发布
       - name: Package + publish (signed with Azure Trusted Signing)
-        if: ${{ secrets.AZURE_ENDPOINT != '' }}
+        if: env.AZURE_ENDPOINT != ''
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          AZURE_ACCOUNT: ${{ secrets.AZURE_ACCOUNT }}
-          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
         run: npx electron-builder --publish always --config release-sign.json
 
       # 未配置签名密钥 → 直接打包并发布（未签名，首次安装会提示 SmartScreen）
       - name: Package + publish (unsigned)
-        if: ${{ secrets.AZURE_ENDPOINT == '' }}
+        if: env.AZURE_ENDPOINT == ''
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --publish always
 
       - name: Show artifacts
