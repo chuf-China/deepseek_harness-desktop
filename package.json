@@ -59,7 +59,7 @@
       "provider": "github",
       "owner": "chuf-China",
       "repo": "deepseek_harness-desktop",
-      "draft": false
+      "releaseType": "release"
     }
   ]
 }
