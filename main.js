@@ -700,24 +700,28 @@ function installAndQuit(installer) {
   const newExe = path.join(dir, 'DeepSeek Harness.exe');
   const q = (s) => (s || '').replace(/'/g, "''");
   const ps = [
-    // v0.1.6 关键修正：不用 -Command 传多行脚本（实测会被 Windows 命令行解析破坏，
-    // 表现为 powershell 启动即退、无任何日志）；改写成临时 .ps1 文件 + -File 执行，
-    // 彻底绕开命令行解析坑。
-    //   1) 先杀进程（路径级，等进程真正消失）——不依赖 taskkill /t /im（助手自身是应用后代进程，/t 会连助手一起杀）
-    //   2) 先清注册表再删目录——注册表清了，安装器就检测不到旧版，走全新安装覆盖，
-    //      永远不会触发 electron-builder 的 uninstallOldVersion（"无法关闭 / exit 2" 的根源）
-    //   3) 删目录失败不再退出——注册表已清 + 进程已死，安装器静默覆盖安装即可成功
-    // 全流程写日志到 %TEMP%\dsh-install.log，任何一步失败都能定位
+    // v0.1.8 新增：WinForms 安装进度窗口（独立显示，应用退出后照常更新）。
+    //   - 每步更新状态文字 + 进度条，成功显示"安装完成"，失败显示退出码，不再无声无息。
+    //   - 成功判定改用安装器进程退出码（Start-Process -PassThru 轮询），比"newExe 存在"
+    //     可靠（目录删不掉时旧 exe 一直存在，旧逻辑会误判成功）。
+    //   - ps1 文件写入时加 UTF-8 BOM，保证中文文案在 PowerShell 5.1 下不乱码。
     `$LOG = Join-Path $env:TEMP 'dsh-install.log'; "=== installAndQuit $(Get-Date -Format s) installer='${q(installer)}' ===" | Out-File $LOG -Encoding utf8`,
+    // ---- UI 初始化（失败不影响安装，仅无窗口） ----
+    'Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue',
+    `$script:ui = $null; try { $script:ui = New-Object System.Windows.Forms.Form; $script:ui.Text = 'DeepSeek Harness 更新安装'; $script:ui.Width = 500; $script:ui.Height = 180; $script:ui.StartPosition = 'CenterScreen'; $script:ui.TopMost = $true; $script:ui.FormBorderStyle = 'FixedDialog'; $script:ui.MaximizeBox = $false; $script:ui.MinimizeBox = $false; $script:lbl = New-Object System.Windows.Forms.Label; $script:lbl.Location = New-Object System.Drawing.Point(18, 16); $script:lbl.Size = New-Object System.Drawing.Size(460, 26); $script:lbl.Text = '正在准备安装...'; $script:bar = New-Object System.Windows.Forms.ProgressBar; $script:bar.Location = New-Object System.Drawing.Point(18, 56); $script:bar.Size = New-Object System.Drawing.Size(460, 24); $script:bar.Minimum = 0; $script:bar.Maximum = 100; $script:ui.Controls.Add($script:lbl); $script:ui.Controls.Add($script:bar); $script:ui.Show(); $script:ui.Refresh() } catch { $script:ui = $null }`,
+    `function Set-UI([string]$msg, [int]$pct) { if ($script:ui) { try { $script:lbl.Text = $msg; $script:bar.Value = $pct; $script:ui.Refresh() } catch {} } }`,
+    // ---- 步骤 1：等应用退出后杀安装目录进程（路径级，等真正消失） ----
+    "Set-UI '正在关闭旧版本进程...' 10",
     'Start-Sleep -Seconds 6',
     `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
     // 轮询等待安装目录进程全部消失（最多 30 秒），避免句柄未释放导致删目录/覆盖失败
     `for ($w = 0; $w -lt 30; $w++) { $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }; if (-not $left) { break }; Start-Sleep -Seconds 1 }; "after kill: left=$(@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }).Count)" | Out-File $LOG -Append -Encoding utf8`,
+    // ---- 步骤 2：先清注册表（关键！放删目录之前——注册表清了安装器就当全新安装） ----
+    "Set-UI '正在清理旧版本注册表...' 30",
     'Start-Sleep -Seconds 3',
-    // 先清注册表（关键！放在删目录之前）
     "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force; Write-Output ('removed-reg: ' + $_.PSPath) | Out-File $LOG -Append -Encoding utf8 } } catch {} } }",
-    // 删目录：尽力而为（多轮重试 + rd /s /q 兜底），失败不中止——注册表已清 + 进程已死，
-    // 安装器静默覆盖安装即可成功（v0.1.7 实测：删目录失败但覆盖安装成功）。
+    // ---- 步骤 3：删目录（尽力而为，失败不中止——覆盖安装兜底） ----
+    "Set-UI '正在清理旧版本文件...' 45",
     // 第一轮：10 次 Remove-Item（每次失败等 2 秒）
     `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
     // 第二轮：仍失败则等 5 秒（句柄延迟释放）再重试 5 次
@@ -725,18 +729,19 @@ function installAndQuit(installer) {
     // 第三轮：rd /s /q 兜底；并记录仍占用的进程（诊断用，不中止）
     `if (Test-Path '${q(dir)}') { "del-dir-failed (pass2), trying rd" | Out-File $LOG -Append -Encoding utf8; cmd /c rd /s /q '${q(dir)}' 2>$null }; "after del: dirExists=$(Test-Path '${q(dir)}')" | Out-File $LOG -Append -Encoding utf8`,
     `$lockers = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }); if ($lockers.Count) { "lockers: " + (($lockers | ForEach-Object { $_.Name + '#' + $_.ProcessId }) -join ', ') | Out-File $LOG -Append -Encoding utf8 }`,
-    `"launching installer" | Out-File $LOG -Append -Encoding utf8; Start-Process -FilePath '${q(installer)}' -ArgumentList '/S'`,
-    '$deadline = (Get-Date).AddMinutes(3)',
-    `while (-not (Test-Path '${q(newExe)}') -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }; "after wait: newExeExists=$(Test-Path '${q(newExe)}')" | Out-File $LOG -Append -Encoding utf8`,
-    `if (Test-Path '${q(newExe)}') { Start-Process -FilePath '${q(newExe)}' } else { Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
+    // ---- 步骤 4：启动安装器并等待退出（用退出码判定成败） ----
+    `Set-UI '正在安装新版本（静默）...' 60; "launching installer" | Out-File $LOG -Append -Encoding utf8; $proc = Start-Process -FilePath '${q(installer)}' -ArgumentList '/S' -PassThru`,
+    `$deadline = (Get-Date).AddMinutes(3); $pct = 60; while (-not $proc.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2; $proc.Refresh(); $pct = [Math]::Min(95, $pct + 2); Set-UI ('正在安装新版本... ' + $pct + '%') $pct }; "installer exited=$($proc.HasExited) code=$(if ($proc.HasExited) { $proc.ExitCode } else { 'timeout' })" | Out-File $LOG -Append -Encoding utf8`,
+    // ---- 步骤 5：结果展示 + 重启 ----
+    `if ($proc.HasExited -and $proc.ExitCode -eq 0 -and (Test-Path '${q(newExe)}')) { Set-UI '安装完成！正在启动新版本...' 100; Start-Sleep -Seconds 2; try { $script:ui.Close() } catch {}; Start-Process -FilePath '${q(newExe)}' } else { $code = if ($proc.HasExited) { $proc.ExitCode } else { 'timeout' }; Set-UI ('安装失败（安装器退出码: ' + $code + '），请查看 ' + $LOG) 100; Start-Sleep -Seconds 8; try { $script:ui.Close() } catch {}; Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
   ].join('\r\n');
   // v0.1.7 关键修正：不能用 spawn detached:true 直接起 powershell——实测 detached 在
   // Windows 上会让 powershell 启动即退（-Command 与 -File 都一样，连 Write-Output 都不执行）。
   // 正确姿势：写一个 .cmd 批处理（CRLF），内部用 `start "" /min powershell.exe -File ...`，
   // 由 cmd 的 start 把 powershell 完全脱离父进程；父进程（应用）退出后它继续跑。
-  // 写临时 .ps1 文件
+  // 写临时 .ps1 文件（加 UTF-8 BOM，保证 PowerShell 5.1 正确解析中文 UI 文案）
   const ps1 = path.join(process.env.TEMP || '.', 'dsh-install.ps1');
-  try { fs.writeFileSync(ps1, ps, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e))); }
+  try { fs.writeFileSync(ps1, '\uFEFF' + ps, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e))); }
   // 写临时 .cmd 批处理（必须 CRLF，LF 会被 cmd 解析破坏）
   const cmdPath = path.join(process.env.TEMP || '.', 'dsh-install.cmd');
   const cmdBody = '@echo off\r\nstart "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ps1 + '"\r\n';
