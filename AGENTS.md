@@ -18,11 +18,16 @@ vendor**；上游更新就改一行版本号。
 ```
 main.js (Electron 主进程)
   ├─ findFreePort() 找空闲端口
-  ├─ spawn 标准 node（优先捆绑 resources/node/node.exe，回退系统 node）
-  │    --expose-internals <dsh bin> web --port <N>
-  ├─ waitForReady() 探测 HTTP 就绪
+  ├─ launchDsh()：spawn 标准 node（优先捆绑 resources/node/node.exe，回退系统 node）
+  │    --expose-internals <dsh bin> web --port <N> → waitForReady() 探测 HTTP 就绪
   ├─ BrowserWindow → http://127.0.0.1:<N>/   （不内嵌 UI，壳核分离）
-  ├─ Tray 托盘：关窗=隐藏不退出；托盘菜单 显示/退出
+  ├─ Tray 托盘：关窗=隐藏不退出；托盘菜单 显示/开机自启/退出
+  ├─ 开机自启：托盘勾选 → 直接写 HKCU\...\Run（reg.exe，带引号 + --hidden）；
+  │    --hidden 启动 = 静默到托盘不弹窗（不用 electron setLoginItemSettings，
+  │    它写的值不带引号，exe 路径含空格时开机启动会被截断）
+  ├─ dsh 崩溃自动重启：exit 且非主动退出 → handleDshCrash() 退避重试（1s~5s，
+  │    最多 5 次；连续稳定 30s 后重置计数；超限弹框退出）；托盘气泡提示；
+  │    waitForReady 用 isDead 回调感知"就绪前崩溃"避免双重重启
   └─ 退出：Windows 用 taskkill /pid <dsh> /T /F 回收整棵子进程树
 ```
 
@@ -45,7 +50,7 @@ main.js (Electron 主进程)
    走托盘"退出"或 `app.quit()`。`before-quit` 里先 `stopDsh()` 再 `app.quit()`。
 7. **退出必须回收 dsh 子进程树**：Windows 用 `taskkill /pid <pid> /T /F`（主进程
    exit 后 dsh 不会自己死）。区分"主动退出"（`quitting=true`）和"dsh 自己崩了"
-   （弹错误框）。
+   （自动重启，见架构图；重启超限才弹错误框）。
 
 ## 常用命令
 
@@ -92,7 +97,10 @@ npm run dist
    更新（`npm run dist` + 自动安装）。真正发布前需把 `publish.owner/repo` 改成实际
    仓库并在 Release 上传 `latest.yml` + 安装包。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。
-4. **平台**：当前 `build` 只配了 `win/nsis`（Windows），macOS/Linux 未支持。
+4. **开机自启仅 Windows + 打包版**：托盘"开机自启"直接写 `HKCU\...\Run`（reg.exe，
+   值带引号 + `--hidden`）；开发模式（`electron .`）禁用该开关。自启/`--hidden`
+   启动只驻留托盘不弹窗；此时 dsh 崩溃自动重启照常生效。
+5. **平台**：当前 `build` 只配了 `win/nsis`（Windows），macOS/Linux 未支持。
 
 ## 给 agent 的排查提示
 

@@ -6,14 +6,16 @@
  * 职责：
  *   1. spawn 本地 dsh（`dsh web --port <N>`），等它的 web 服务就绪；
  *   2. 开一个 BrowserWindow 指向 http://127.0.0.1:<N>/（不内嵌 UI，壳核分离）；
- *   3. 系统托盘：关窗不退出（隐藏到托盘），托盘菜单可“显示 / 退出”；
- *   4. 真正退出时回收整棵 dsh 子进程树（Windows 用 taskkill /T）。
+ *   3. 系统托盘：关窗不退出（隐藏到托盘），托盘菜单可“显示 / 开机自启 / 退出”；
+ *   4. 开机自启：托盘勾选开关（Windows Run 注册表项），自启带 --hidden 静默启动到托盘；
+ *   5. dsh 意外退出自动重启：退避重试最多 5 次，连续稳定 30s 后重置计数，超限弹框退出；
+ *   6. 真正退出时回收整棵 dsh 子进程树（Windows 用 taskkill /T）。
  *
  * 内核 @deepseek-ai/dsh 作为 npm 依赖锁定版本，绝不 fork/vendor。
  */
 
 const { app, BrowserWindow, Tray, Menu, dialog, nativeImage, nativeTheme, ipcMain } = require('electron');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
@@ -22,11 +24,20 @@ const fs = require('node:fs');
 /** dsh web 就绪探测的总超时（毫秒）。 */
 const READY_TIMEOUT_MS = 120_000;
 
+/** 开机自启参数：带 --hidden 启动时不弹主窗口，只驻留托盘。 */
+const silentStart = process.argv.includes('--hidden');
+
+/** dsh 崩溃自动重启：最多重试次数，以及“连续稳定运行多久后重置计数”。 */
+const MAX_CRASH_RESTARTS = 5;
+const STABLE_MS = 30_000;
+
 let dshProc = null;
 let mainWindow = null;
 let tray = null;
 let quitting = false; // 主动退出标记：区分“我们杀它”和“它自己崩了”
 let patchExeOnQuit = null; // 退出时给已安装 exe 打图标的 { exe, ico, rcedit }
+let crashRetries = 0; // 连续崩溃次数（dsh 稳定运行后重置）
+let dshStableSince = 0; // dsh 最近一次就绪的时刻（毫秒时间戳），0 = 尚未就绪
 
 /* ------------------------------------------------------------------ */
 /* dsh 定位                                                            */
@@ -69,10 +80,17 @@ function findFreePort() {
   });
 }
 
-function waitForReady(url, timeoutMs = READY_TIMEOUT_MS) {
+function waitForReady(url, timeoutMs = READY_TIMEOUT_MS, isDead = null) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const tick = () => {
+      // dsh 在就绪前就退出了：让退出处理器负责重试，这里立即中止等待。
+      if (isDead && isDead()) {
+        const err = new Error('dsh 进程已退出，等待就绪中止');
+        err.code = 'DSH_DIED';
+        reject(err);
+        return;
+      }
       const req = http.get(url, (res) => {
         res.resume();
         resolve();
@@ -125,14 +143,7 @@ function startDsh(port) {
 
   dshProc.on('exit', (code, signal) => {
     dshProc = null;
-    if (!quitting) {
-      dialog.showErrorBox(
-        'DeepSeek Harness 已停止',
-        `dsh 进程意外退出（code=${code}, signal=${signal}）。`,
-      );
-      quitting = true;
-      app.quit();
-    }
+    if (!quitting) handleDshCrash(code, signal);
   });
 }
 
@@ -153,6 +164,77 @@ function stopDsh() {
     }
   }
   dshProc = null;
+}
+
+/* ------------------------------------------------------------------ */
+/* dsh 崩溃自动重启                                                     */
+/* ------------------------------------------------------------------ */
+
+function handleDshCrash(code, signal) {
+  const now = Date.now();
+  // 若 dsh 已稳定运行超过阈值，说明这次崩溃是偶发的，重置连续崩溃计数。
+  if (dshStableSince && now - dshStableSince >= STABLE_MS) crashRetries = 0;
+  crashRetries += 1;
+  console.log(`[shell] dsh 意外退出（code=${code}, signal=${signal}），第 ${crashRetries} 次自动重启`);
+
+  if (crashRetries > MAX_CRASH_RESTARTS) {
+    console.error('[shell] dsh 连续崩溃，停止自动重启');
+    dialog.showErrorBox(
+      'DeepSeek Harness 已停止',
+      `dsh 进程连续自动重启 ${MAX_CRASH_RESTARTS} 次仍未恢复（code=${code}, signal=${signal}）。\n请查看日志后手动启动。`,
+    );
+    quitting = true;
+    app.quit();
+    return;
+  }
+
+  const delay = Math.min(1000 * crashRetries, 5000); // 1s, 2s, 3s, 4s, 5s 退避
+  if (tray && process.platform === 'win32') {
+    try {
+      tray.displayBalloon({
+        title: 'DeepSeek Harness',
+        content: `dsh 意外退出，${Math.round(delay / 1000)}s 后自动重启（第 ${crashRetries} 次）`,
+      });
+    } catch { /* 托盘气泡尽力而为 */ }
+  }
+  setTimeout(() => {
+    if (quitting) return;
+    launchDsh().catch((err) => {
+      console.error('[shell] dsh 自动重启失败：', err);
+      dialog.showErrorBox('DeepSeek Harness 已停止', `dsh 自动重启失败：${err.message}`);
+      quitting = true;
+      app.quit();
+    });
+  }, delay);
+}
+
+// 启动（或崩溃后重启）dsh：找端口 → spawn → 等就绪 → 挂到窗口。
+// dsh 在就绪前就退出时，退出处理器负责重试，这里以 DSH_DIED 静默返回。
+async function launchDsh() {
+  if (quitting) return;
+  const port = await findFreePort();
+  if (quitting) return;
+  startDsh(port);
+  try {
+    await waitForReady(`http://127.0.0.1:${port}/`, READY_TIMEOUT_MS, () => dshProc === null);
+  } catch (err) {
+    if (err && err.code === 'DSH_DIED') return; // 退出处理器已接管重启
+    throw err;
+  }
+  dshStableSince = Date.now();
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      // 崩溃重启：窗口还在，直接重载到新端口
+      await mainWindow.loadURL(`http://127.0.0.1:${port}/`);
+    } else {
+      // 首次启动：创建窗口（静默启动时保持隐藏，托盘可再显示）
+      await createWindow(port);
+    }
+  } catch (err) {
+    // dsh 在就绪后、页面加载完成前又退出：退出处理器已接管重启，这里不再报错退出。
+    if (dshProc === null && !quitting) return;
+    throw err;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,9 +262,72 @@ function createTray() {
 
   tray = new Tray(icon);
   tray.setToolTip('DeepSeek Harness');
+  rebuildTrayMenu();
+  tray.on('click', showMainWindow);
+  tray.on('double-click', showMainWindow);
+}
+
+/* 开机自启：直接写 HKCU\...\Run 注册表项（electron 的 setLoginItemSettings 写出的
+   值不引号包裹，exe 路径带空格时会在开机启动时被截断，故不用它）。
+   自启命令 = "已安装 exe" --hidden（带引号 + 静默启动参数）。
+   开发模式（electron .）不支持，避免把 electron.exe 本身注册进开机启动。 */
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const RUN_VALUE = 'DeepSeek Harness';
+
+function runReg(args) {
+  try {
+    execFileSync('reg.exe', args, { windowsHide: true, stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
+
+function getAutostart() {
+  if (process.platform !== 'win32' || !app.isPackaged) return false;
+  return runReg(['query', RUN_KEY, '/v', RUN_VALUE]);
+}
+
+function setAutostart(enabled) {
+  if (process.platform !== 'win32' || !app.isPackaged) return false;
+  if (enabled) {
+    const data = `"${process.execPath}" --hidden`;
+    runReg(['add', RUN_KEY, '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', data, '/f']);
+  } else {
+    runReg(['delete', RUN_KEY, '/v', RUN_VALUE, '/f']);
+  }
+  return getAutostart();
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: '显示 DeepSeek Harness', click: showMainWindow },
+      { type: 'separator' },
+      {
+        label: '开机自启（静默启动到托盘）',
+        type: 'checkbox',
+        checked: getAutostart(),
+        click: (item) => {
+          if (!app.isPackaged) {
+            dialog.showMessageBox({
+              type: 'info',
+              message: '开机自启仅打包版可用',
+              detail: '开发模式（electron .）不支持注册开机启动，请使用打包后的安装版。',
+            });
+            rebuildTrayMenu();
+            return;
+          }
+          const ok = setAutostart(item.checked);
+          if (ok !== item.checked) {
+            dialog.showMessageBox({
+              type: 'warning',
+              message: '设置开机自启失败',
+              detail: '写入 Windows 启动项时出错。',
+            });
+          }
+          rebuildTrayMenu();
+        },
+      },
       { type: 'separator' },
       {
         label: '退出',
@@ -193,8 +338,6 @@ function createTray() {
       },
     ]),
   );
-  tray.on('click', showMainWindow);
-  tray.on('double-click', showMainWindow);
 }
 
 async function createWindow(port) {
@@ -213,7 +356,9 @@ async function createWindow(port) {
     },
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    if (!silentStart) mainWindow.show();
+  });
 
   // 关窗 → 隐藏到托盘（不销毁、dsh 继续跑）；真正退出时放行。
   mainWindow.on('close', (event) => {
@@ -662,11 +807,8 @@ ipcMain.on('shell:theme', (_event, isDark) => {
 /* ------------------------------------------------------------------ */
 
 async function bootstrap() {
-  const port = await findFreePort();
-  startDsh(port);
-  await waitForReady(`http://127.0.0.1:${port}/`);
-  await createWindow(port);
   createTray();
+  await launchDsh();
 }
 
 /* ------------------------------------------------------------------ */
@@ -677,7 +819,11 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => showMainWindow());
+  app.on('second-instance', (_event, argv) => {
+    // 开机自启（--hidden）撞上已在运行的实例时保持静默，不打扰。
+    if (argv.includes('--hidden')) return;
+    showMainWindow();
+  });
 
   app.on('before-quit', () => {
     quitting = true;
