@@ -67,7 +67,7 @@ function presetDisplayName(presetDir) {
   try {
     const raw = fs.readFileSync(path.join(presetDir, 'preset.yml'), 'utf8');
     const m = /(?:^|\n)\s*name\s*:\s*(.+?)\s*(?:\n|$)/.exec(raw);
-    if (m) return m[1].trim();
+    if (m) return m[1].trim().replace(/^["']|["']$/g, ''); // 去掉 YAML 引号
   } catch { /* 忽略 */ }
   return path.basename(presetDir);
 }
@@ -204,9 +204,10 @@ function readSkill(file, root, kind) {
 }
 
 // 扫描全部根，返回按 name 排序的技能列表（同名不同根都列出，展示所属根）。
-function scanSkills() {
+// roots 可选：传预计算的 skillRoots() 结果可避免重复扫描（skills:list 用）。
+function scanSkills(roots) {
   const out = [];
-  for (const root of skillRoots()) {
+  for (const root of (roots || skillRoots())) {
     let entries;
     try { entries = fs.readdirSync(root.dir, { withFileTypes: true }); } catch { continue; }
     for (const ent of entries) {
@@ -338,10 +339,11 @@ function deleteSkill(name) {
 function registerSkillsIpc() {
   ipcMain.handle('skills:list', () => {
     try {
+      const roots = skillRoots();
       return {
         ok: true,
-        skills: scanSkills(),
-        roots: skillRoots().map((r) => ({ label: r.label, dir: r.dir })),
+        skills: scanSkills(roots),
+        roots: roots.map((r) => ({ label: r.label, dir: r.dir })),
         userSkillDir: userSkillDir(),
       };
     } catch (e) {

@@ -76,7 +76,9 @@ main.js (Electron 主进程)
    用 `spawn('cmd.exe', ['/c', cmdPath], {stdio:'ignore', windowsHide:true})` 起
    （**不 detached**，`cmd /c start` 已实现脱离父进程且能跑完）。**全文件唯一允许
    `detached:true` 的 spawn 是 exe 图标补丁**（`spawnExePatch`，退出后独立完成，
-   别把这条经验扩散到别处）。
+   别把这条经验扩散到别处）。助手脚本本体在 `assets/install-helper.ps1`（可读可查、
+   可单独语法检查），参数一律走环境变量（DSH_INSTALLER/DSH_DIR/DSH_NEWEXE/DSH_LOG），
+   **不要退回在 main.js 里拼字符串内联**——引号转义出错会把关键更新路径搞坏。
 9. **`update:quit-install` 只走 `installAndQuit` 干净状态静默安装**，绝不回退
    `autoUpdater.quitAndInstall()`（旧流程会触发 old-uninstaller → exit 2 /
    "无法关闭"死循环）。安装包定位不依赖 `update-downloaded` 事件时序，用
@@ -123,12 +125,12 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 | `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新（双通道）+ `installAndQuit`（干净静默安装 + WinForms 进度 UI）+ `findDownloadedInstaller`（updater 缓存兜底定位安装包）+ `shellHasChanges`（通道判定） |
 | `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`，以及各 Agent preset 自带的 `skills/`，如网络专家/创造模式），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
 | `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：设置弹窗「通用设置」更新卡片 + 左侧「技能」分区技能卡片注入、`skills` 桥、主题同步 |
-| `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏） |
+| `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏）+ `install-helper.ps1`（安装助手脚本，installAndQuit 经环境变量传参调用） |
 | `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例，替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑 |
 | `generate-icons.ps1` | 本地工具：从 `icon.svg` 生成各尺寸 png / ico |
 | `update-exe-icon.cmd` | 本地工具：用 rcedit 重打 exe 图标（配合图标补丁逻辑测试） |
 | `node/` | 捆绑的标准 node.exe（`extraResources` → `resources/node/node.exe`，随包分发；**git 忽略**，由 `release.cmd` / CI 从系统 node 生成） |
-| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases；owner/repo 已写死真实仓库 `chuf-China/deepseek_harness-desktop`） |
+| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases；owner/repo 已写死真实仓库 `chuf-China/deepseek_harness-desktop`）。`build.extraResources` 只保留 `node` 侧车条目；`@deepseek-ai` 作用域由 electron-builder 自动收集（依赖树会嵌套进 `dsh/node_modules`，实测可正常启动）——**不要**再加回 `extraResources` 复制 `@deepseek-ai`：会与自动收集重复，安装包徒增 ~6MB |
 | `.github/workflows/release.yml` | 推 `v*` tag 自动打包（有 Azure 密钥则签名）并发布 Release（含 `latest.yml` + 安装包 + blockmap）；无密钥则未签名发布。其中"占位符替换"步骤对当前 package.json 已是空操作，保留无害 |
 | `release.cmd` | 一键发布：版本号 → 本地打包校验 → 提交 → 打 tag → 推送（CI 随后自动打包上传） |
 | `release-sign.json` | Azure Trusted Signing 签名配置（仅 CI 有对应 Secrets 时启用） |
@@ -185,6 +187,9 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 
 ## 给 agent 的排查提示
 
+- **壳自身日志**：`%APPDATA%\deepseek-harness-desktop\shell.log`——dsh 启动/崩溃
+  自动重启/更新/安装全过程（从 Explorer 双击启动时控制台不可见，一切以它为准；
+  超过 10MB 滚动为 shell.log.1）。
 - 桌面端运行时，dsh 是独立 node 进程（命令行形如
   `node --expose-internals ...\@deepseek-ai\dsh\lib\bin.js web --port <N>`），
   监听 127.0.0.1 随机端口；壳主进程是 `DeepSeek Harness.exe`，子进程带

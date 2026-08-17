@@ -14,8 +14,8 @@
  * 内核 @deepseek-ai/dsh 作为 npm 依赖锁定版本，绝不 fork/vendor。
  */
 
-const { app, BrowserWindow, Tray, Menu, dialog, nativeImage, nativeTheme, ipcMain } = require('electron');
-const { spawn, execFileSync } = require('node:child_process');
+const { app, BrowserWindow, Tray, Menu, dialog, nativeImage, nativeTheme, ipcMain, shell } = require('electron');
+const { spawn, spawnSync, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
@@ -23,6 +23,45 @@ const fs = require('node:fs');
 
 // 技能面板数据服务（壳侧）：扫描/读写技能文件 + skills:* IPC（见 skills.js）。
 require('./skills');
+
+/* ------------------------------------------------------------------ */
+/* 日志：控制台 + <userData>/shell.log                                  */
+/* 从 Explorer 双击启动时没有控制台，崩溃/更新/安装过程全部落盘，        */
+/* 排查时直接看 %APPDATA%\deepseek-harness-desktop\shell.log。          */
+/* ------------------------------------------------------------------ */
+
+const LOG_FILE = (() => {
+  try { return path.join(app.getPath('userData'), 'shell.log'); } catch { return null; }
+})();
+
+const LOG_MAX_BYTES = 10 * 1024 * 1024; // 超过 10MB 滚成 shell.log.1
+
+function appendLogFile(line) {
+  if (!LOG_FILE) return;
+  try {
+    try {
+      if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+        try { fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch { /* 忽略 */ }
+      }
+    } catch { /* 文件尚不存在 */ }
+    fs.appendFileSync(LOG_FILE, line + '\n', 'utf8');
+  } catch { /* 写日志失败不致命 */ }
+}
+
+function log(level, msg) {
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
+  console.log(line);
+  appendLogFile(line);
+}
+
+// 兜底：任何未捕获异常/拒绝都落盘而不是静默消失（不主动退出——dsh 崩溃重启、
+// 更新安装这些关键路径有自己的错误处理与弹框，这里只保证"看得见"）。
+process.on('uncaughtException', (err) => {
+  log('error', 'uncaughtException: ' + ((err && err.stack) || err));
+});
+process.on('unhandledRejection', (reason) => {
+  log('error', 'unhandledRejection: ' + ((reason && reason.stack) || reason));
+});
 
 /** dsh web 就绪探测的总超时（毫秒）。 */
 const READY_TIMEOUT_MS = 120_000;
@@ -146,8 +185,8 @@ function startDsh(port) {
     windowsHide: true,
   });
 
-  dshProc.stdout.on('data', (d) => process.stdout.write(`[dsh] ${d}`));
-  dshProc.stderr.on('data', (d) => process.stderr.write(`[dsh] ${d}`));
+  dshProc.stdout.on('data', (d) => log('dsh', String(d).replace(/\s+$/, '')));
+  dshProc.stderr.on('data', (d) => log('dsh', String(d).replace(/\s+$/, '')));
 
   dshProc.on('error', (err) => {
     dialog.showErrorBox(
@@ -168,8 +207,10 @@ function stopDsh() {
   if (!dshProc || dshProc.pid == null) return;
   const pid = dshProc.pid;
   if (process.platform === 'win32') {
+    // 用 spawnSync：退出路径（before-quit / installAndQuit）需要确保整棵 dsh
+    // 子进程树在应用退出前确实被杀掉（taskkill 很快，同步等待无感知）。
     try {
-      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
     } catch {
       /* 尽力而为 */
     }
@@ -192,10 +233,10 @@ function handleDshCrash(code, signal) {
   // 若 dsh 已稳定运行超过阈值，说明这次崩溃是偶发的，重置连续崩溃计数。
   if (dshStableSince && now - dshStableSince >= STABLE_MS) crashRetries = 0;
   crashRetries += 1;
-  console.log(`[shell] dsh 意外退出（code=${code}, signal=${signal}），第 ${crashRetries} 次自动重启`);
+  log('warn', `dsh 意外退出（code=${code}, signal=${signal}），第 ${crashRetries} 次自动重启`);
 
   if (crashRetries > MAX_CRASH_RESTARTS) {
-    console.error('[shell] dsh 连续崩溃，停止自动重启');
+    log('error', 'dsh 连续崩溃，停止自动重启');
     dialog.showErrorBox(
       'DeepSeek Harness 已停止',
       `dsh 进程连续自动重启 ${MAX_CRASH_RESTARTS} 次仍未恢复（code=${code}, signal=${signal}）。\n请查看日志后手动启动。`,
@@ -231,6 +272,7 @@ async function launchDsh() {
   if (quitting) return;
   const port = await findFreePort();
   if (quitting) return;
+  log('info', `启动 dsh web（端口 ${port}）`);
   startDsh(port);
   try {
     await waitForReady(`http://127.0.0.1:${port}/`, READY_TIMEOUT_MS, () => dshProc === null);
@@ -398,6 +440,31 @@ async function createWindow(port) {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+
+  // 安全加固（窗口加载的是本地 dsh 页面，不能让它把应用导航到外部站点）：
+  // - window.open / target=_blank → 交给系统浏览器打开，窗口内一律拒绝；
+  // - 页面导航离开本地 dsh 源（127.0.0.1 / localhost）→ 阻止并转系统浏览器；
+  // - 禁用 webview 注入（壳不需要）。
+  const isAppOrigin = (url) => {
+    try {
+      const u = new URL(url);
+      return u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+    } catch { return false; }
+  };
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) {
+      try { shell.openExternal(url); } catch { /* 忽略 */ }
+    }
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isAppOrigin(url)) return;
+    event.preventDefault();
+    if (/^https?:/i.test(url)) {
+      try { shell.openExternal(url); } catch { /* 忽略 */ }
+    }
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
 
   await mainWindow.loadURL(`http://127.0.0.1:${port}/`);
 }
@@ -576,7 +643,8 @@ ipcMain.handle('settings:apply-icon', () => doApplyIcon());
 /* 更新：壳 + dsh 内核双通道，一个按钮一起处理 --------------------------- */
 
 // 本地源码项目目录：打包运行时无法自动推断，默认取本机开发目录，设置页可改。
-const DEFAULT_PROJECT_DIR = 'C:\\Users\\Administrator\\Desktop\\deepseek harness';
+// DSH_PROJECT_DIR 环境变量可覆盖（换了机器/换了仓库位置不用改代码）。
+const DEFAULT_PROJECT_DIR = process.env.DSH_PROJECT_DIR || 'C:\\Users\\Administrator\\Desktop\\deepseek harness';
 
 function getProjectDir() {
   return DEFAULT_PROJECT_DIR;
@@ -731,54 +799,39 @@ async function runUpdate({ projectDir, upgradeDsh }) {
 //   杀全部进程（含逃逸的 dsh node）→ 删安装目录 → 清注册表 → 静默装新版 → 自动重启。
 // 与手动修复脚本 fix-install-v2 同逻辑（已实测通过）；安装器面对全新状态，
 // 不会触发"卸载旧版"路径，"无法关闭 / exit 2" 结构性消失。
+// 由分离的 PowerShell 助手执行（根本性修复 v0.1.3）：
+// 不再依赖 electron-builder 的"旧卸载器"流程——旧卸载器在本机反复非零退出
+// （安装器 exit 2 / 重试后弹"无法关闭"），其依赖（注册表状态、进程彻底死透、
+// 无残留锁文件）任一不满足就失败。改为彻底清理后全新安装：
+//   杀全部进程（含逃逸的 dsh node）→ 删安装目录 → 清注册表 → 静默装新版 → 自动重启。
+// 与手动修复脚本 fix-install-v2 同逻辑（已实测通过）；安装器面对全新状态，
+// 不会触发"卸载旧版"路径，"无法关闭 / exit 2" 结构性消失。
+//
+// 助手脚本本体在 assets/install-helper.ps1（可读可查可单测的独立文件），参数走
+// 环境变量（DSH_INSTALLER / DSH_DIR / DSH_NEWEXE / DSH_LOG），不再在 JS 里拼
+// 字符串内联——避免引号转义把关键更新路径搞坏。
 function installAndQuit(installer) {
   const exe = installedExePath();
   const dir = exe ? path.dirname(exe) : path.join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness');
   const newExe = path.join(dir, 'DeepSeek Harness.exe');
-  const q = (s) => (s || '').replace(/'/g, "''");
-  const ps = [
-    // v0.1.8 新增：WinForms 安装进度窗口（独立显示，应用退出后照常更新）。
-    //   - 每步更新状态文字 + 进度条，成功显示"安装完成"，失败显示退出码，不再无声无息。
-    //   - 成功判定改用安装器进程退出码（Start-Process -PassThru 轮询），比"newExe 存在"
-    //     可靠（目录删不掉时旧 exe 一直存在，旧逻辑会误判成功）。
-    //   - ps1 文件写入时加 UTF-8 BOM，保证中文文案在 PowerShell 5.1 下不乱码。
-    `$LOG = Join-Path $env:TEMP 'dsh-install.log'; "=== installAndQuit $(Get-Date -Format s) installer='${q(installer)}' ===" | Out-File $LOG -Encoding utf8`,
-    // ---- UI 初始化（失败不影响安装，仅无窗口） ----
-    'Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue',
-    `$script:ui = $null; try { $script:ui = New-Object System.Windows.Forms.Form; $script:ui.Text = 'DeepSeek Harness 更新安装'; $script:ui.Width = 500; $script:ui.Height = 180; $script:ui.StartPosition = 'CenterScreen'; $script:ui.TopMost = $true; $script:ui.FormBorderStyle = 'FixedDialog'; $script:ui.MaximizeBox = $false; $script:ui.MinimizeBox = $false; $script:lbl = New-Object System.Windows.Forms.Label; $script:lbl.Location = New-Object System.Drawing.Point(18, 16); $script:lbl.Size = New-Object System.Drawing.Size(460, 26); $script:lbl.Text = '正在准备安装...'; $script:bar = New-Object System.Windows.Forms.ProgressBar; $script:bar.Location = New-Object System.Drawing.Point(18, 56); $script:bar.Size = New-Object System.Drawing.Size(460, 24); $script:bar.Minimum = 0; $script:bar.Maximum = 100; $script:ui.Controls.Add($script:lbl); $script:ui.Controls.Add($script:bar); $script:ui.Show(); $script:ui.Refresh() } catch { $script:ui = $null }`,
-    `function Set-UI([string]$msg, [int]$pct) { if ($script:ui) { try { $script:lbl.Text = $msg; $script:bar.Value = $pct; $script:ui.Refresh() } catch {} } }`,
-    // ---- 步骤 1：等应用退出后杀安装目录进程（路径级，等真正消失） ----
-    "Set-UI '正在关闭旧版本进程...' 10",
-    'Start-Sleep -Seconds 6',
-    `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
-    // 轮询等待安装目录进程全部消失（最多 30 秒），避免句柄未释放导致删目录/覆盖失败
-    `for ($w = 0; $w -lt 30; $w++) { $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }; if (-not $left) { break }; Start-Sleep -Seconds 1 }; "after kill: left=$(@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }).Count)" | Out-File $LOG -Append -Encoding utf8`,
-    // ---- 步骤 2：先清注册表（关键！放删目录之前——注册表清了安装器就当全新安装） ----
-    "Set-UI '正在清理旧版本注册表...' 30",
-    'Start-Sleep -Seconds 3',
-    "@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall') | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object { try { $p = Get-ItemProperty $_.PSPath -ErrorAction Stop; if ($p.DisplayName -like '*DeepSeek*') { Remove-Item $_.PSPath -Recurse -Force; Write-Output ('removed-reg: ' + $_.PSPath) | Out-File $LOG -Append -Encoding utf8 } } catch {} } }",
-    // ---- 步骤 3：删目录（尽力而为，失败不中止——覆盖安装兜底） ----
-    "Set-UI '正在清理旧版本文件...' 45",
-    // 第一轮：10 次 Remove-Item（每次失败等 2 秒）
-    `for ($i = 0; $i -lt 10; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } }`,
-    // 第二轮：仍失败则等 5 秒（句柄延迟释放）再重试 5 次
-    `if (Test-Path '${q(dir)}') { "del-dir-failed (pass1), waiting 5s then retry" | Out-File $LOG -Append -Encoding utf8; Start-Sleep -Seconds 5; for ($i = 0; $i -lt 5; $i++) { if (-not (Test-Path '${q(dir)}')) { break }; try { Remove-Item '${q(dir)}' -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 2 } } }`,
-    // 第三轮：rd /s /q 兜底；并记录仍占用的进程（诊断用，不中止）
-    `if (Test-Path '${q(dir)}') { "del-dir-failed (pass2), trying rd" | Out-File $LOG -Append -Encoding utf8; cmd /c rd /s /q '${q(dir)}' 2>$null }; "after del: dirExists=$(Test-Path '${q(dir)}')" | Out-File $LOG -Append -Encoding utf8`,
-    `$lockers = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${q(dir)}*' }); if ($lockers.Count) { "lockers: " + (($lockers | ForEach-Object { $_.Name + '#' + $_.ProcessId }) -join ', ') | Out-File $LOG -Append -Encoding utf8 }`,
-    // ---- 步骤 4：启动安装器并等待退出（用退出码判定成败） ----
-    `Set-UI '正在安装新版本（静默）...' 60; "launching installer" | Out-File $LOG -Append -Encoding utf8; $proc = Start-Process -FilePath '${q(installer)}' -ArgumentList '/S' -PassThru`,
-    `$deadline = (Get-Date).AddMinutes(3); $pct = 60; while (-not $proc.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2; $proc.Refresh(); $pct = [Math]::Min(95, $pct + 2); Set-UI ('正在安装新版本... ' + $pct + '%') $pct }; "installer exited=$($proc.HasExited) code=$(if ($proc.HasExited) { $proc.ExitCode } else { 'timeout' })" | Out-File $LOG -Append -Encoding utf8`,
-    // ---- 步骤 5：结果展示 + 重启 ----
-    `if ($proc.HasExited -and $proc.ExitCode -eq 0 -and (Test-Path '${q(newExe)}')) { Set-UI '安装完成！正在启动新版本...' 100; Start-Sleep -Seconds 2; try { $script:ui.Close() } catch {}; Start-Process -FilePath '${q(newExe)}' } else { $code = if ($proc.HasExited) { $proc.ExitCode } else { 'timeout' }; Set-UI ('安装失败（安装器退出码: ' + $code + '），请查看 ' + $LOG) 100; Start-Sleep -Seconds 8; try { $script:ui.Close() } catch {}; Start-Process -FilePath '${q(newExe)}' -ErrorAction SilentlyContinue }`,
-  ].join('\r\n');
+
   // v0.1.7 关键修正：不能用 spawn detached:true 直接起 powershell——实测 detached 在
   // Windows 上会让 powershell 启动即退（-Command 与 -File 都一样，连 Write-Output 都不执行）。
   // 正确姿势：写一个 .cmd 批处理（CRLF），内部用 `start "" /min powershell.exe -File ...`，
   // 由 cmd 的 start 把 powershell 完全脱离父进程；父进程（应用）退出后它继续跑。
   // 写临时 .ps1 文件（加 UTF-8 BOM，保证 PowerShell 5.1 正确解析中文 UI 文案）
   const ps1 = path.join(process.env.TEMP || '.', 'dsh-install.ps1');
-  try { fs.writeFileSync(ps1, '\uFEFF' + ps, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e))); }
+  try {
+    const ps = fs.readFileSync(path.join(__dirname, 'assets', 'install-helper.ps1'), 'utf8');
+    fs.writeFileSync(ps1, '\uFEFF' + ps, 'utf8');
+  } catch (e) {
+    sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e)));
+    log('error', 'install-helper: 写入安装脚本失败 ' + ((e && e.message) || String(e)));
+    quitting = true;
+    stopDsh();
+    app.quit();
+    return;
+  }
   // 写临时 .cmd 批处理（必须 CRLF，LF 会被 cmd 解析破坏）
   const cmdPath = path.join(process.env.TEMP || '.', 'dsh-install.cmd');
   const cmdBody = '@echo off\r\nstart "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ps1 + '"\r\n';
@@ -787,8 +840,16 @@ function installAndQuit(installer) {
     // 注意：不要 detached:true（会让 powershell 启动即死）；cmd /c start 已实现脱离
     stdio: 'ignore',
     windowsHide: true,
+    env: {
+      ...process.env,
+      DSH_INSTALLER: installer,
+      DSH_DIR: dir,
+      DSH_NEWEXE: newExe,
+      DSH_LOG: path.join(process.env.TEMP || '.', 'dsh-install.log'),
+    },
   });
   child.unref();
+  log('info', `install-helper 已启动（installer=${installer} dir=${dir}）`);
   // 稍等片刻让用户看到日志，再真正退出（助手会等应用退出后执行清理与安装）
   setTimeout(() => {
     quitting = true;

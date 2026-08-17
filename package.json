@@ -26,10 +26,6 @@
     },
     "extraResources": [
       {
-        "from": "node_modules/@deepseek-ai",
-        "to": "app/node_modules/@deepseek-ai"
-      },
-      {
         "from": "node",
         "to": "node"
       }
@@ -63,13 +59,5 @@
     ]
   },
   "author": "DeepSeek Harness Desktop Contributors",
-  "license": "MIT",
-  "publish": [
-    {
-      "provider": "github",
-      "owner": "chuf-China",
-      "repo": "deepseek_harness-desktop",
-      "releaseType": "release"
-    }
-  ]
+  "license": "MIT"
 }

@@ -14,6 +14,16 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// skills:* IPC 薄封装：contextBridge 暴露给主世界一份，技能卡片（跑在 preload
+// 隔离世界，window.__DSH_DESKTOP__ 不可见）复用同一份，避免两处重复定义。
+const skillsApi = {
+  list: () => ipcRenderer.invoke('skills:list'),
+  create: (name, body) => ipcRenderer.invoke('skills:create', name, body),
+  update: (name, body) => ipcRenderer.invoke('skills:update', name, body),
+  delete: (name) => ipcRenderer.invoke('skills:delete', name),
+  openFolder: (name) => ipcRenderer.invoke('skills:open-folder', name),
+};
+
 contextBridge.exposeInMainWorld(
   '__DSH_DESKTOP__',
   Object.freeze({
@@ -25,13 +35,7 @@ contextBridge.exposeInMainWorld(
     downloadUpdate: () => ipcRenderer.invoke('update:download'),
     quitAndInstall: () => ipcRenderer.invoke('update:quit-install'),
     applyIcon: () => ipcRenderer.invoke('settings:apply-icon'),
-    skills: {
-      list: () => ipcRenderer.invoke('skills:list'),
-      create: (name, body) => ipcRenderer.invoke('skills:create', name, body),
-      update: (name, body) => ipcRenderer.invoke('skills:update', name, body),
-      delete: (name) => ipcRenderer.invoke('skills:delete', name),
-      openFolder: (name) => ipcRenderer.invoke('skills:open-folder', name),
-    },
+    skills: skillsApi,
     onUpdateLog: (cb) => {
       const listener = (_event, msg) => cb(msg);
       ipcRenderer.on('settings:update-log', listener);
@@ -532,13 +536,8 @@ function injectSkillsCardInto(dialog, container) {
   const logEl = q('[data-log]');
   // 注意：卡片代码运行在 preload 隔离世界，window.__DSH_DESKTOP__（contextBridge
   // 暴露给主世界）在这里不可见，必须直接用本作用域的 ipcRenderer。
-  const skills = {
-    list: () => ipcRenderer.invoke('skills:list'),
-    create: (name, body) => ipcRenderer.invoke('skills:create', name, body),
-    update: (name, body) => ipcRenderer.invoke('skills:update', name, body),
-    delete: (name) => ipcRenderer.invoke('skills:delete', name),
-    openFolder: (name) => ipcRenderer.invoke('skills:open-folder', name),
-  };
+  // 复用顶部统一的 skills:* IPC 封装（本作用域可直接访问，无需走 window 桥）
+  const skills = skillsApi;
 
   let skillsData = null;
   let listVersion = 0; // 防止快速连续刷新时旧响应覆盖新响应
