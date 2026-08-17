@@ -7,3 +7,6 @@ node/
 
 # Windows Packet Monitor logs
 PktMon.*
+
+# local one-off push helper
+push-upload.cmd
