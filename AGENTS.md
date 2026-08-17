@@ -126,11 +126,11 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 | `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`，以及各 Agent preset 自带的 `skills/`，如网络专家/创造模式），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
 | `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：设置弹窗「通用设置」更新卡片 + 左侧「技能」分区技能卡片注入、`skills` 桥、主题同步 |
 | `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏）+ `install-helper.ps1`（安装助手脚本，installAndQuit 经环境变量传参调用） |
-| `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例 + 按"从安装目录运行"路径兜底清理残留进程（孤儿 dsh node 侧车锁文件 = "无法关闭"exit 2 的根因，v0.1.11 修复），替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑。注意：NSIS 里 PowerShell 的 `$_` 必须写成 `$_.`（直接写 `$_` 触发 NSIS warning 6000，electron-builder 把警告当错误） |
+| `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例 + 按"从安装目录运行"路径兜底清理残留进程（孤儿 dsh node 侧车锁文件 = "无法关闭"exit 2 的根因，v0.1.11 修复），替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑。注意：NSIS 里 PowerShell 的 `$_` 必须写成 `$$_.`（直接写 `$_` 触发 NSIS warning 6000，electron-builder 把警告当错误） |
 | `generate-icons.ps1` | 本地工具：从 `icon.svg` 生成各尺寸 png / ico |
 | `update-exe-icon.cmd` | 本地工具：用 rcedit 重打 exe 图标（配合图标补丁逻辑测试） |
 | `node/` | 捆绑的标准 node.exe（`extraResources` → `resources/node/node.exe`，随包分发；**git 忽略**，由 `release.cmd` / CI 从系统 node 生成） |
-| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases；owner/repo 已写死真实仓库 `chuf-China/deepseek_harness-desktop`）。`build.extraResources` 只保留 `node` 侧车条目；`@deepseek-ai` 作用域由 electron-builder 自动收集（依赖树会嵌套进 `dsh/node_modules`，实测可正常启动）——**不要**再加回 `extraResources` 复制 `@deepseek-ai`：会与自动收集重复，安装包徒增 ~6MB |
+| `package.json` | 依赖 + `build`（electron-builder）配置 + `publish`（更新源，GitHub Releases；owner/repo 已写死真实仓库 `chuf-China/deepseek_harness-desktop`）。`build.extraResources` **必须**保留两条：`@deepseek-ai`（承重：自动收集的嵌套依赖树会漏 20 个包（cordis-plugin-group / dsh-shell / dsh-workflow 等），dsh 完整启动会 ERR_MODULE_NOT_FOUND——删掉它应用打不开，2026-08 实测翻车已恢复）+ `node` 侧车 |
 | `.github/workflows/release.yml` | 推 `v*` tag 自动打包（有 Azure 密钥则签名）并发布 Release（含 `latest.yml` + 安装包 + blockmap）；无密钥则未签名发布。其中"占位符替换"步骤对当前 package.json 已是空操作，保留无害 |
 | `release.cmd` | 一键发布：版本号 → 本地打包校验 → 提交 → 打 tag → 推送（CI 随后自动打包上传） |
 | `release-sign.json` | Azure Trusted Signing 签名配置（仅 CI 有对应 Secrets 时启用） |

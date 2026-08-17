@@ -26,6 +26,10 @@
     },
     "extraResources": [
       {
+        "from": "node_modules/@deepseek-ai",
+        "to": "app/node_modules/@deepseek-ai"
+      },
+      {
         "from": "node",
         "to": "node"
       }
