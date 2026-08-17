@@ -3,7 +3,8 @@
 /**
  * 技能面板数据服务（壳侧实现，壳核分离铁律：不动内核、零新依赖）。
  *
- * 与内核 `@deepseek-ai/dsh-skill-filesystem` provider 扫描**相同**的技能根目录、
+ * 与内核 `@deepseek-ai/dsh-skill-filesystem` provider 扫描相同的用户/项目技能根目录，
+ * 另外也会扫描各 Agent preset 自带的 skills 目录（如“网络专家”“创造模式”），
  * 解析 SKILL.md 的 frontmatter；新建/编辑/删除 = 直接读写技能文件。内核用
  * Chokidar 监听这些根，所以面板改动会被当前会话实时感知（输入框 / 补全、
  * 模型技能目录自动刷新），无需重启。
@@ -48,12 +49,66 @@ function projectRoot() {
   return process.cwd();
 }
 
+// 随附（内置）Agent preset 根目录：@deepseek-ai/dsh/config/agent-presets。
+function builtinAgentPresetsRoot() {
+  try {
+    const pkg = require.resolve('@deepseek-ai/dsh/package.json');
+    return path.join(path.dirname(pkg), 'config', 'agent-presets');
+  } catch { return null; }
+}
+
+// 用户自建 Agent preset 根目录：<dshHome>/.agent-presets。
+function userAgentPresetsRoot() {
+  return path.join(dshHome(), '.agent-presets');
+}
+
+// 读取 preset 目录的展示名（preset.yml 里的 name），读不到就用目录名。
+function presetDisplayName(presetDir) {
+  try {
+    const raw = fs.readFileSync(path.join(presetDir, 'preset.yml'), 'utf8');
+    const m = /(?:^|\n)\s*name\s*:\s*(.+?)\s*(?:\n|$)/.exec(raw);
+    if (m) return m[1].trim();
+  } catch { /* 忽略 */ }
+  return path.basename(presetDir);
+}
+
+// 收集各 Agent preset 自带的 skills 目录（如“网络专家”“创造模式”），
+// 让技能库能看到这些模式内嵌的技能，而不是只显示用户/项目根里的技能。
+function presetSkillRoots() {
+  const out = [];
+  const userBase = userAgentPresetsRoot();
+  const bases = [
+    { dir: builtinAgentPresetsRoot(), user: false },
+    { dir: userBase, user: true },
+  ];
+  for (const { dir: base, user } of bases) {
+    if (!base) continue;
+    let entries;
+    try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
+      const presetDir = path.join(base, ent.name);
+      const skillsDir = path.join(presetDir, 'skills');
+      if (!fs.existsSync(skillsDir)) continue;
+      out.push({
+        key: (user ? 'preset-user-' : 'preset-system-') + ent.name,
+        rank: user ? 350 : 300,
+        label: presetDisplayName(presetDir) + '（预设技能）',
+        dir: skillsDir,
+        readonly: !user, // 随附 preset 的技能属于安装目录，只读展示，不允许在面板里改/删
+      });
+    }
+  }
+  return out;
+}
+
 // 返回 [{ key, rank, label, dir }]，仅包含实际存在的根。
 function skillRoots() {
   const proj = projectRoot();
   const candidates = [
     { key: 'project-dsh', rank: 100, label: '项目 .dsh/skills', dir: path.join(proj, '.dsh', 'skills') },
     { key: 'project-agents', rank: 200, label: '项目 .agents/skills', dir: path.join(proj, '.agents', 'skills') },
+    ...presetSkillRoots(),
     { key: 'user-dsh', rank: 400, label: '用户 ~/.dsh/skills', dir: path.join(dshHome(), 'skills') },
     { key: 'user-agents', rank: 500, label: '用户 ~/.agents/skills', dir: path.join(agentsHome(), 'skills') },
   ];
@@ -137,6 +192,7 @@ function readSkill(file, root, kind) {
     modelInvocable: dm === null ? true : !dm,
     userInvocable: ui === null ? true : ui,
     invalid,
+    readonly: root.readonly === true,
     path: file,
     rootLabel: root.label,
     rootKey: root.key,
@@ -237,6 +293,7 @@ function createSkill(name, body) {
 function updateSkill(name, body) {
   const item = findSkillByName(name);
   if (!item) return { ok: false, error: '未找到技能：' + name };
+  if (item.readonly) return { ok: false, error: '内置预设技能为只读，不能修改' };
   try {
     const incoming = String(body || '');
     const parsed = parseFrontmatter(incoming);
@@ -261,6 +318,7 @@ function updateSkill(name, body) {
 function deleteSkill(name) {
   const item = findSkillByName(name);
   if (!item) return { ok: false, error: '未找到技能：' + name };
+  if (item.readonly) return { ok: false, error: '内置预设技能为只读，不能删除' };
   try {
     if (item.kind === 'bundle') {
       fs.rmSync(path.dirname(item.path), { recursive: true, force: true });

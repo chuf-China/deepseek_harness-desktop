@@ -5,9 +5,11 @@
  *
  * 1. 通过 contextBridge 暴露 __DSH_DESKTOP__（与 dsh 自己的 __DSH_BOOT__ 不冲突），
  *    提供更新/图标等原生能力。
- * 2. 用 MutationObserver 监听 DOM，把壳自有的「更新」卡片插入 dsh web 原生设置
- *    弹窗的内容区（导航之后的 options 容器），颜色从弹窗计算样式动态取值，
- *    自动跟随浅色/深色主题，不破坏原生结构（壳核分离，不动内核代码）。
+ * 2. 用 MutationObserver 监听 DOM，在 dsh web 原生设置弹窗的左侧导航里增加一个
+ *    「技能」分区，把技能卡片放到这个分区里；右侧内容区展示技能库。
+ *    更新卡片仍留在「通用设置」里，不和技能卡片混在一起。
+ *    颜色从弹窗计算样式动态取值，自动跟随浅色/深色主题，不破坏原生结构
+ *    （壳核分离，不动内核代码）。
  */
 
 const { contextBridge, ipcRenderer } = require('electron');
@@ -39,12 +41,13 @@ contextBridge.exposeInMainWorld(
 );
 
 /* ------------------------------------------------------------------ */
-/* 原生设置弹窗注入「更新」卡片                                          */
+/* 原生设置弹窗注入「技能」侧边分区 + 技能卡片                            */
 /* ------------------------------------------------------------------ */
 
 // 更新日志订阅（跨注入复用，避免 tab 切换重注入时重复监听）
 let updateLogListener = null;
 
+// 原生设置弹窗里由 dsh 自己渲染的 options 容器（导航右侧的内容区）。
 function findOptionsContainer(dialog) {
   const nav = dialog.querySelector('nav');
   const children = [...dialog.children];
@@ -52,6 +55,111 @@ function findOptionsContainer(dialog) {
   if (!content) return dialog;
   const options = [...content.children].find((c) => /options/i.test(typeof c.className === 'string' ? c.className : '')) || content;
   return options;
+}
+
+// 原生设置弹窗的内容根（nav 之外的 content 容器）。
+function findContentContainer(dialog) {
+  const nav = dialog.querySelector('nav');
+  const children = [...dialog.children];
+  return children.find((c) => c !== nav) || dialog;
+}
+
+// 原生设置弹窗的左侧导航列表。
+function findNavList(dialog) {
+  const nav = dialog.querySelector('nav');
+  if (!nav) return null;
+  return [...nav.children].find((el) => /navList/i.test(typeof el.className === 'string' ? el.className : '')) || nav;
+}
+
+// 技能分区是否处于激活状态。
+function isSkillsActive(dialog) {
+  return dialog.hasAttribute('data-dsh-skills-active');
+}
+
+// 同步左侧导航的高亮：激活技能分区时取消原生项的高亮，否则取消技能项高亮。
+function syncSkillsNavState(dialog, active) {
+  const navList = findNavList(dialog);
+  if (!navList) return;
+  const skills = navList.querySelector('[data-dsh-skills-nav]');
+
+  if (active && skills) {
+    // 先记下当前原生 active 类，再清掉原生高亮并把它给技能项。
+    const activeClass = [...navList.querySelectorAll('button')]
+      .map((b) => [...b.classList].find((c) => /active/i.test(c)))
+      .find(Boolean);
+    if (activeClass) skills.classList.add(activeClass);
+    skills.setAttribute('aria-current', 'true');
+
+    for (const button of navList.querySelectorAll('button:not([data-dsh-skills-nav])')) {
+      const cls = [...button.classList].find((c) => /active/i.test(c));
+      if (cls) button.classList.remove(cls);
+      button.removeAttribute('aria-current');
+    }
+  } else if (skills) {
+    const cls = [...skills.classList].find((c) => /active/i.test(c));
+    if (cls) skills.classList.remove(cls);
+    skills.removeAttribute('aria-current');
+  }
+}
+
+// 在设置弹窗左侧导航加入「技能」入口（只加一次，React 重渲染后由 observer 补回）。
+function ensureSkillsNav(dialog) {
+  const navList = findNavList(dialog);
+  if (!navList || dialog.querySelector('[data-dsh-skills-nav]')) return;
+
+  const template = navList.querySelector('button');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.setAttribute('data-dsh-skills-nav', '');
+  if (template) {
+    // 沿用内核 nav 按钮的样式类，但不继承 active。
+    button.className = template.className.split(/\s+/)
+      .filter((c) => !/active/i.test(c))
+      .join(' ');
+    const icon = template.querySelector('[class*="navIcon"]');
+    if (icon) button.appendChild(icon.cloneNode(true));
+    const label = template.querySelector('[class*="navLabel"]');
+    const labelSpan = document.createElement('span');
+    if (label) labelSpan.className = label.className;
+    labelSpan.textContent = '技能';
+    button.appendChild(labelSpan);
+  } else {
+    button.textContent = '技能';
+  }
+
+  button.addEventListener('click', () => {
+    dialog.setAttribute('data-dsh-skills-active', '');
+    syncSkillsNavState(dialog, true);
+    ensureCards();
+  });
+  navList.appendChild(button);
+}
+
+// 原生导航项被点击时退出技能分区，回到 dsh 自己的设置页。
+function bindNativeNavSwitches(dialog) {
+  const navList = findNavList(dialog);
+  if (!navList) return;
+  for (const button of navList.querySelectorAll('button:not([data-dsh-skills-nav])')) {
+    if (button.dataset.dshNavBound) continue;
+    button.dataset.dshNavBound = '1';
+    button.addEventListener('click', () => {
+      if (!isSkillsActive(dialog)) return;
+      dialog.removeAttribute('data-dsh-skills-active');
+      syncSkillsNavState(dialog, false);
+      ensureCards();
+    });
+  }
+}
+
+// 技能分区的内容容器：右侧展示技能库（技能卡片）。
+function ensureSkillsSection(dialog) {
+  if (dialog.querySelector('[data-dsh-skills-section-host]')) return;
+  const content = findContentContainer(dialog);
+  const host = document.createElement('div');
+  host.setAttribute('data-dsh-skills-section-host', '');
+  host.hidden = true;
+  host.style.cssText = 'flex:1;min-height:0;padding:0 24px 24px;overflow-y:auto;';
+  content.appendChild(host);
 }
 
 // 全部用 currentColor（从弹窗继承的当前文字色）动态取色，
@@ -104,7 +212,7 @@ function cardStyle() {
 `;
 }
 
-function injectUpdateCardInto(dialog) {
+function injectUpdateCardInto(dialog, container) {
   // 卡片宿主在 light DOM（shadow root 内容无法被外部 querySelector 命中），
   // 用 host 标记判断是否已注入，避免重复注入死循环。
   if (dialog.querySelector('[data-dsh-update-card-host]')) return null;
@@ -225,8 +333,7 @@ function injectUpdateCardInto(dialog) {
     }
   });
 
-  const container = findOptionsContainer(dialog);
-  container.appendChild(host);
+  (container || findOptionsContainer(dialog)).appendChild(host);
   return host;
 }
 
@@ -236,7 +343,19 @@ function findSettingsDialog() {
     [...d.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === '通用设置'));
 }
 
-// 只在「通用设置」页签注入；其它页签（模型/插件/Agent 预设）不注入。
+// 技能分区激活时隐藏 dsh 原生 options，右侧展示技能库；
+// 其它页签则隐藏技能分区并恢复原生 options。
+function syncSkillsVisibility(dialog, active) {
+  const nativeOptions = findOptionsContainer(dialog);
+  const content = findContentContainer(dialog);
+  // 只在确实存在独立 options 容器时隐藏它；万一内核结构变化，不能把 content 一起藏掉。
+  if (nativeOptions && nativeOptions !== content) nativeOptions.hidden = active;
+
+  const skills = dialog.querySelector('[data-dsh-skills-section-host]');
+  if (skills) skills.hidden = !active;
+}
+
+// 是否正停留在 dsh 的「通用设置」页签。
 function isGeneralTabActive(dialog) {
   const cells = [...dialog.querySelectorAll('button')].filter((b) => /nav/i.test(b.className || ''));
   if (cells.length === 0) return true;
@@ -248,16 +367,38 @@ function isGeneralTabActive(dialog) {
 function ensureCards() {
   const dialog = findSettingsDialog();
   if (!dialog) return;
-  if (!isGeneralTabActive(dialog)) {
-    // 切到其它页签时移除卡片（避免每个页签都出现）
+
+  // 无论当前在哪个页签，都要保证左侧导航里有「技能」入口，并让原生导航点击能退出。
+  ensureSkillsNav(dialog);
+  ensureSkillsSection(dialog);
+  bindNativeNavSwitches(dialog);
+
+  const active = isSkillsActive(dialog);
+  syncSkillsNavState(dialog, active);
+  syncSkillsVisibility(dialog, active);
+
+  if (active) {
+    // 技能库：只放技能卡片，更新卡片不混进来。
     const u = dialog.querySelector('[data-dsh-update-card-host]');
     if (u) u.remove();
-    const s = dialog.querySelector('[data-dsh-skills-card-host]');
-    if (s) s.remove();
+    const skills = dialog.querySelector('[data-dsh-skills-section-host]');
+    if (!skills) return;
+    injectSkillsCardInto(dialog, skills);
     return;
   }
-  injectUpdateCardInto(dialog);
-  injectSkillsCardInto(dialog);
+
+  // 非技能分区：隐藏/移除技能卡片，恢复 dsh 原生设置内容。
+  const s = dialog.querySelector('[data-dsh-skills-card-host]');
+  if (s) s.remove();
+  const skills = dialog.querySelector('[data-dsh-skills-section-host]');
+  if (skills) skills.hidden = true;
+
+  if (isGeneralTabActive(dialog)) {
+    injectUpdateCardInto(dialog, findOptionsContainer(dialog));
+  } else {
+    const u = dialog.querySelector('[data-dsh-update-card-host]');
+    if (u) u.remove();
+  }
 }
 
 function startObserver() {
@@ -278,11 +419,20 @@ function skillsCardStyle() {
 .skills { margin-top: 4px; }
 .skills .toolbar { display: flex; gap: 8px; align-items: center; margin: 8px 0 2px; }
 .skills .toolbar .hint { flex: auto; font-size: 12px; color: color-mix(in srgb, currentColor 55%, transparent); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skills .group-header { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 18px 0 2px; padding: 2px 0; user-select: none; }
+.skills .group-title { font-size: 13px; font-weight: 600; color: color-mix(in srgb, currentColor 62%, transparent); flex: none; }
+.skills .group-header:hover .group-title { color: currentColor; }
+.skills .group-count { font-size: 11px; line-height: 18px; padding: 0 8px; border-radius: 999px; flex: none; background: color-mix(in srgb, currentColor 10%, transparent); color: color-mix(in srgb, currentColor 60%, transparent); }
+.skills .group-chevron { margin-left: auto; font-size: 12px; color: color-mix(in srgb, currentColor 45%, transparent); transition: transform .15s ease; }
+.skills .group-header.collapsed .group-chevron { transform: rotate(-90deg); }
+.skills .group-empty { margin: 4px 0 12px; padding: 8px 12px; border: 1px dashed color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; font-size: 12px; line-height: 18px; color: color-mix(in srgb, currentColor 55%, transparent); }
 .skills .skill {
   border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
   border-radius: 12px; padding: 8px 10px; margin: 6px 0;
   background: color-mix(in srgb, currentColor 4%, transparent);
+  animation: dsh-skill-in .18s ease both;
 }
+@keyframes dsh-skill-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .skills .skill.invalid { border-color: color-mix(in srgb, #f2545b 60%, transparent); }
 .skills .head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .skills .name { font-weight: 600; font-size: 14px; color: currentColor; flex: none; }
@@ -344,7 +494,7 @@ function skillsTemplate(name) {
     '# 技能正文\n\n在这里写具体的操作指引（skill 工具会把全文注入给模型）。\n';
 }
 
-function injectSkillsCardInto(dialog) {
+function injectSkillsCardInto(dialog, container) {
   if (dialog.querySelector('[data-dsh-skills-card-host]')) return null;
 
   const host = document.createElement('div');
@@ -392,6 +542,7 @@ function injectSkillsCardInto(dialog) {
 
   let skillsData = null;
   let listVersion = 0; // 防止快速连续刷新时旧响应覆盖新响应
+  const collapsedGroups = {}; // 分组折叠状态：{ global?: boolean, project?: boolean, preset?: boolean }
 
   const appendLog = (msg, color) => {
     logEl.classList.add('show');
@@ -419,13 +570,59 @@ function injectSkillsCardInto(dialog) {
     return { text: '已禁用', cls: 'none' };
   }
 
+  function groupOf(s) {
+    if (s.rootKey && s.rootKey.startsWith('project-')) return 'project';
+    if (s.rootKey && s.rootKey.startsWith('preset-')) return 'preset';
+    return 'global';
+  }
+
   function renderList() {
     listEl.textContent = '';
     if (!skillsData || skillsData.skills.length === 0) {
       listEl.appendChild(el('div', 'empty', '暂无技能——点右上角「+ 新建技能」创建第一个。'));
       return;
     }
-    for (const s of skillsData.skills) renderItem(s);
+
+    const groups = [
+      {
+        id: 'global',
+        title: '全局技能',
+        empty: '还没有全局技能。点右上角「+ 新建技能」创建后，会放到 ~/.dsh/skills。',
+      },
+      {
+        id: 'project',
+        title: '项目技能',
+        empty: '当前项目还没有技能。可在项目的 .dsh/skills 或 .agents/skills 下手动添加。',
+      },
+      {
+        id: 'preset',
+        title: '预设技能',
+        empty: '当前没有预设技能。',
+      },
+    ];
+    const byGroup = { global: [], project: [], preset: [] };
+    for (const s of skillsData.skills) byGroup[groupOf(s)].push(s);
+
+    for (const group of groups) {
+      const items = byGroup[group.id];
+      const collapsed = collapsedGroups[group.id] === true;
+      const header = el('div', 'group-header' + (collapsed ? ' collapsed' : ''));
+      header.appendChild(el('span', 'group-title', group.title));
+      header.appendChild(el('span', 'group-count', String(items.length)));
+      header.appendChild(el('span', 'group-chevron', '▾'));
+      header.addEventListener('click', () => {
+        collapsedGroups[group.id] = !collapsed;
+        renderList();
+      });
+      listEl.appendChild(header);
+
+      if (items.length === 0) {
+        listEl.appendChild(el('div', 'group-empty', group.empty));
+        continue;
+      }
+      if (collapsed) continue;
+      for (const s of items) renderItem(s);
+    }
   }
 
   function renderItem(s) {
@@ -443,8 +640,10 @@ function injectSkillsCardInto(dialog) {
     const delBtn = el('button', 'mini danger', '删除');
     delBtn.type = 'button';
     head.appendChild(openBtn);
-    head.appendChild(editBtn);
-    head.appendChild(delBtn);
+    if (!s.readonly) {
+      head.appendChild(editBtn);
+      head.appendChild(delBtn);
+    }
     row.appendChild(head);
 
     if (s.description) row.appendChild(el('div', 'desc', s.description));
@@ -609,8 +808,7 @@ function injectSkillsCardInto(dialog) {
 
   reload();
 
-  const container = findOptionsContainer(dialog);
-  container.appendChild(host);
+  (container || findOptionsContainer(dialog)).appendChild(host);
   return host;
 }
 

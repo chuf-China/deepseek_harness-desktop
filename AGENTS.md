@@ -29,8 +29,8 @@ main.js (Electron 主进程)
   │    最多 5 次；连续稳定 30s 后重置计数；超限弹框退出）；托盘气泡提示；
   │    waitForReady 用 isDead 回调感知"就绪前崩溃"避免双重重启
   ├─ skills.js：技能面板数据服务（壳侧）——扫描与内核 dsh-skill-filesystem 相同的
-  │    技能根目录、读写 SKILL.md，注册 skills:* IPC；preload 在设置弹窗注入
-  │    「技能」卡片；内核 Chokidar 监听技能根，面板改动被会话实时感知
+  │    技能根目录、读写 SKILL.md，注册 skills:* IPC；preload 在设置弹窗左侧「技能」分区注入技能卡片（右侧技能库）
+  │    更新卡片仍留在「通用设置」；内核 Chokidar 监听技能根，面板改动被会话实时感知
   ├─ 更新（双通道）：
   │    ├─ 真实通道：electron-updater（build.publish → GitHub Releases latest.yml）；
   │    │    update:quit-install → findDownloadedInstaller()（扫 updater 缓存兜底，
@@ -119,8 +119,8 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 | 文件/目录 | 作用 |
 |---|---|
 | `main.js` | 主进程：spawn dsh、端口/就绪探测、窗口、托盘、退出回收、更新（双通道）+ `installAndQuit`（干净静默安装 + WinForms 进度 UI）+ `findDownloadedInstaller`（updater 缓存兜底定位安装包）+ `shellHasChanges`（通道判定） |
-| `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（与内核 `dsh-skill-filesystem` 同一批根目录：项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
-| `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：更新卡片 + 技能卡片注入、`skills` 桥、主题同步 |
+| `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`，以及各 Agent preset 自带的 `skills/`，如网络专家/创造模式），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
+| `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：设置弹窗「通用设置」更新卡片 + 左侧「技能」分区技能卡片注入、`skills` 桥、主题同步 |
 | `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏） |
 | `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例，替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑 |
 | `generate-icons.ps1` | 本地工具：从 `icon.svg` 生成各尺寸 png / ico |
