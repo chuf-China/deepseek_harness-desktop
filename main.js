@@ -620,6 +620,19 @@ function normalizeVersion(v) {
   return String(v || '').trim().replace(/^[~^<>= ]+/, '');
 }
 
+// 安装包文件名比较：按版本号数值排序。不能用默认字典序——"0.1.10" 会排在
+// "0.1.9" 前面，取"最后一个"时总是选到旧版安装包（本地通道永远装不上新版本）。
+function compareSetupVersions(a, b) {
+  const nums = (s) => (String(s).match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?/) || []).slice(1).map((n) => parseInt(n, 10) || 0);
+  const va = nums(a);
+  const vb = nums(b);
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+    const d = (va[i] || 0) - (vb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
 function getUpdateInfo() {
   const projectDir = getProjectDir();
   const info = { projectDir, shellVersion: null, dshPinned: null, dshInstalled: null, installer: null, shellChanged: shellHasChanges() };
@@ -635,7 +648,7 @@ function getUpdateInfo() {
   try {
     const distDir = path.join(projectDir, 'dist');
     const files = fs.readdirSync(distDir).filter((f) => /^DeepSeek Harness Setup .*\.exe$/i.test(f));
-    files.sort();
+    files.sort(compareSetupVersions);
     if (files.length) info.installer = path.join(distDir, files[files.length - 1]);
   } catch { /* 无 dist */ }
   return info;
@@ -881,7 +894,7 @@ function findDownloadedInstaller() {
     if (!fs.existsSync(cacheDir)) return null;
     const files = fs.readdirSync(cacheDir).filter((f) => /^DeepSeek-Harness-Setup-.*\.exe$/i.test(f));
     if (!files.length) return null;
-    files.sort();
+    files.sort(compareSetupVersions);
     const p = path.join(cacheDir, files[files.length - 1]);
     return fs.existsSync(p) ? p : null;
   } catch { return null; }
