@@ -126,7 +126,7 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 | `skills.js` | 技能面板数据服务（壳侧）：扫描/解析/读写技能文件（项目 `.dsh/skills`、`.agents/skills`、`~/.dsh/skills`、`~/.agents/skills`，以及各 Agent preset 自带的 `skills/`，如网络专家/创造模式），注册 `skills:*` IPC；纯逻辑不依赖 electron，可被普通 node 单测 |
 | `preload.js` | 注入 dsh 页面的最小只读桥（命名空间 `__DSH_DESKTOP__`，与 `__DSH_BOOT__` 不冲突）：设置弹窗「通用设置」更新卡片 + 左侧「技能」分区技能卡片注入、`skills` 桥、主题同步 |
 | `assets/` | 应用/托盘图标（`tray.png` 缺失时回退 `icon.png`）+ `installer.nsh`（NSIS 自定义宏）+ `install-helper.ps1`（安装助手脚本，installAndQuit 经环境变量传参调用） |
-| `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例，替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑 |
+| `assets/installer.nsh` | `customCheckAppRunning`：强制 `taskkill /f /t /im` 全部应用实例 + 按"从安装目录运行"路径兜底清理残留进程（孤儿 dsh node 侧车锁文件 = "无法关闭"exit 2 的根因，v0.1.11 修复），替换 electron-builder 默认"进程占用 → 无法关闭，点 Retry"死循环逻辑。注意：NSIS 里 PowerShell 的 `$_` 必须写成 `$_.`（直接写 `$_` 触发 NSIS warning 6000，electron-builder 把警告当错误） |
 | `generate-icons.ps1` | 本地工具：从 `icon.svg` 生成各尺寸 png / ico |
 | `update-exe-icon.cmd` | 本地工具：用 rcedit 重打 exe 图标（配合图标补丁逻辑测试） |
 | `node/` | 捆绑的标准 node.exe（`extraResources` → `resources/node/node.exe`，随包分发；**git 忽略**，由 `release.cmd` / CI 从系统 node 生成） |
@@ -180,7 +180,10 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
   （`npm run dist` + installAndQuit）。开发时把源码同步进安装目录可让本地通道
   变真实通道。
 - **安装器退出码 2 / "无法关闭"** = 旧卸载器流程被触发；正解是先清注册表再删目录
-  （铁律 #9），不是加等待/重试。
+  （铁律 #9），不是加等待/重试。手动安装场景（双击安装包）的"无法关闭"根因是
+  **残留的 dsh node 侧车**（崩溃/重启后的孤儿进程，映像名 node.exe 不在应用名下，
+  `taskkill /t /im` 杀不到）锁住安装目录文件 → 旧卸载器删文件失败；v0.1.11 起
+  `installer.nsh` 已按"从安装目录运行"的路径兜底杀进程。
 - **"点了更新但没反应"**：先查是否退出后无安装进度窗（= helper 没跑起来，对照
   铁律 #8 的 spawn 方式），再看 pending 缓存里有没有安装包（= 下载没完成，与安装
   无关）。
