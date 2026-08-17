@@ -30,6 +30,20 @@ const READY_TIMEOUT_MS = 120_000;
 /** 开机自启参数：带 --hidden 启动时不弹主窗口，只驻留托盘。 */
 const silentStart = process.argv.includes('--hidden');
 
+/** --project <dir>：启动早期 chdir 到指定项目根。自启（HKCU\...\Run）的 cwd 由
+ *  Windows 决定（通常是 System32/用户目录），壳侧面板 projectRoot() 找不到 .git，
+ *  项目技能分组会消失；自启命令带上 --project 后，进程一启动就切到项目根，壳侧
+ *  projectRoot() 与 dsh 子进程（spawn 继承 cwd）都定位到该项目。仅当目录含 .git
+ *  时才生效（与内核"项目根 = 最近含 .git 的祖先"规则一致）。 */
+(function applyProjectArg() {
+  const i = process.argv.indexOf('--project');
+  if (i === -1 || !process.argv[i + 1]) return;
+  try {
+    const dir = path.resolve(process.argv[i + 1]);
+    if (fs.existsSync(path.join(dir, '.git'))) process.chdir(dir);
+  } catch { /* 无效路径忽略 */ }
+})();
+
 /** dsh 崩溃自动重启：最多重试次数，以及“连续稳定运行多久后重置计数”。 */
 const MAX_CRASH_RESTARTS = 5;
 const STABLE_MS = 30_000;
@@ -292,7 +306,17 @@ function getAutostart() {
 function setAutostart(enabled) {
   if (process.platform !== 'win32' || !app.isPackaged) return false;
   if (enabled) {
-    const data = `"${process.execPath}" --hidden`;
+    // 自启命令 = "已安装 exe" --hidden；额外带 --project <本地源码项目>，让开机自启
+    // 的进程启动早期 chdir 回项目根（自启的 cwd 由 Windows 决定，不可控），壳侧面板
+    // "项目技能"分组在自启场景下同样可见。项目根取 getProjectDir()（与本地构建更新
+    // 通道同源），仅当该目录是 git 项目根时才附加。
+    let data = `"${process.execPath}" --hidden`;
+    try {
+      const proj = getProjectDir();
+      if (fs.existsSync(path.join(proj, '.git'))) {
+        data += ` --project "${proj}"`;
+      }
+    } catch { /* 忽略 */ }
     runReg(['add', RUN_KEY, '/v', RUN_VALUE, '/t', 'REG_SZ', '/d', data, '/f']);
   } else {
     runReg(['delete', RUN_KEY, '/v', RUN_VALUE, '/f']);

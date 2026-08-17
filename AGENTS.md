@@ -22,9 +22,11 @@ main.js (Electron 主进程)
   │    --expose-internals <dsh bin> web --port <N> → waitForReady() 探测 HTTP 就绪
   ├─ BrowserWindow → http://127.0.0.1:<N>/   （不内嵌 UI，壳核分离）
   ├─ Tray 托盘：关窗=隐藏不退出；托盘菜单 显示/开机自启/退出
-  ├─ 开机自启：托盘勾选 → 直接写 HKCU\...\Run（reg.exe，带引号 + --hidden）；
-  │    --hidden 启动 = 静默到托盘不弹窗（不用 electron setLoginItemSettings，
-  │    它写的值不带引号，exe 路径含空格时开机启动会被截断）
+  ├─ 开机自启：托盘勾选 → 直接写 HKCU\...\Run（reg.exe，带引号 + --hidden +
+  │    --project "<本地源码项目>"）；--hidden 启动 = 静默到托盘不弹窗（不用
+  │    electron setLoginItemSettings，它写的值不带引号，exe 路径含空格时开机启动
+  │    会被截断）；--project 让自启进程启动早期 chdir 回项目根（自启 cwd 由
+  │    Windows 决定不可控），壳侧面板"项目技能"分组在自启场景下同样可见
   ├─ dsh 崩溃自动重启：exit 且非主动退出 → handleDshCrash() 退避重试（1s~5s，
   │    最多 5 次；连续稳定 30s 后重置计数；超限弹框退出）；托盘气泡提示；
   │    waitForReady 用 isDead 回调感知"就绪前崩溃"避免双重重启
@@ -143,13 +145,15 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
    `chuf-China/deepseek_harness-desktop`，`releaseType: "release"`——顶层 `publish`
    在构建时被忽略，必须放 `build.publish`，见 452274c）。发布流程 = 推 `v*` tag →
    CI 自动打包 → 上传 Release（`latest.yml` + 安装包 + blockmap）；当前最新发布
-   **v0.1.9**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
+   **v0.1.10**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
    （`shellHasChanges()`=true）时回退本地构建更新（`npm run dist` + installAndQuit，
    同样弹安装进度窗）。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。
 4. **开机自启仅 Windows + 打包版**：托盘"开机自启"直接写 `HKCU\...\Run`（reg.exe，
-   值带引号 + `--hidden`）；开发模式（`electron .`）禁用该开关。自启/`--hidden`
-   启动只驻留托盘不弹窗；此时 dsh 崩溃自动重启照常生效。
+   值带引号 + `--hidden` + `--project "<本地源码项目>"`——自启命令固定带上项目根，
+   让自启进程启动早期 chdir 回项目，壳侧面板"项目技能"分组在自启场景下同样可见）；
+   开发模式（`electron .`）禁用该开关。自启/`--hidden` 启动只驻留托盘不弹窗；
+   此时 dsh 崩溃自动重启照常生效。
 5. **平台**：当前 `build` 只配了 `win/nsis`（Windows），macOS/Linux 未支持。
 6. **技能面板（壳侧）**：只做展示 + 文本编辑，不做每会话启停开关（调用策略由
    SKILL.md frontmatter 控制，面板仅展示模型/用户徽标）；新建默认落用户根
