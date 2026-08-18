@@ -149,7 +149,15 @@ function waitForReady(url, timeoutMs = READY_TIMEOUT_MS, isDead = null) {
       }
       const req = http.get(url, (res) => {
         res.resume();
-        resolve();
+        // 只认 2xx 才算就绪：dsh 的 HTTP 服务在路由未就绪时可能返回 4xx/5xx，
+        // 不能把错误页当成"已就绪"（否则窗口会加载错误页、崩溃计数被清零）。
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve();
+        } else if (Date.now() - started >= timeoutMs) {
+          reject(new Error(`dsh 未在 ${Math.round(timeoutMs / 1000)}s 内就绪（HTTP ${res.statusCode}）`));
+        } else {
+          setTimeout(tick, 400);
+        }
       });
       req.on('error', () => {
         if (Date.now() - started >= timeoutMs) {
@@ -233,10 +241,10 @@ function handleDshCrash(code, signal) {
   // 若 dsh 已稳定运行超过阈值，说明这次崩溃是偶发的，重置连续崩溃计数。
   if (dshStableSince && now - dshStableSince >= STABLE_MS) crashRetries = 0;
   crashRetries += 1;
-  log('warn', `dsh 意外退出（code=${code}, signal=${signal}），第 ${crashRetries} 次自动重启`);
 
   if (crashRetries > MAX_CRASH_RESTARTS) {
-    log('error', 'dsh 连续崩溃，停止自动重启');
+    // 已到上限：本次不再重启，先记日志再弹框退出（日志别再说"第 N 次重启"误导）。
+    log('error', `dsh 连续崩溃 ${crashRetries} 次，停止自动重启（code=${code}, signal=${signal}）`);
     dialog.showErrorBox(
       'DeepSeek Harness 已停止',
       `dsh 进程连续自动重启 ${MAX_CRASH_RESTARTS} 次仍未恢复（code=${code}, signal=${signal}）。\n请查看日志后手动启动。`,
@@ -247,6 +255,7 @@ function handleDshCrash(code, signal) {
   }
 
   const delay = Math.min(1000 * crashRetries, 5000); // 1s, 2s, 3s, 4s, 5s 退避
+  log('warn', `dsh 意外退出（code=${code}, signal=${signal}），${Math.round(delay / 1000)}s 后第 ${crashRetries} 次自动重启`);
   if (tray && process.platform === 'win32') {
     try {
       tray.displayBalloon({
@@ -354,6 +363,8 @@ function setAutostart(enabled) {
     // 通道同源），仅当该目录是 git 项目根时才附加。
     let data = `"${process.execPath}" --hidden`;
     try {
+      // 仅当项目目录真实存在（且是 git 根）才附加 --project：发布版在普通用户机器上
+      // 默认项目目录不存在，自然跳过——不会把开发机路径写进别人的注册表。
       const proj = getProjectDir();
       if (fs.existsSync(path.join(proj, '.git'))) {
         data += ` --project "${proj}"`;
@@ -546,10 +557,22 @@ function updateShortcutIcons(icoPath) {
     '}',
     "Write-Output ('updated=' + $count)",
   ].join('\n');
-  return runCaptured('powershell.exe', ['-NoProfile', '-Command', ps], { env: { ...process.env, DSH_ICON: icoPath } });
+  const scriptPath = path.join(process.env.TEMP || '.', 'dsh-shortcut-icons-' + process.pid + '-' + Date.now() + '.ps1');
+  try {
+    fs.writeFileSync(scriptPath, '\uFEFF' + ps, 'utf8');
+  } catch (e) {
+    return Promise.resolve({ ok: false, err: '写入临时脚本失败：' + e.message });
+  }
+  return runCaptured('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { env: { ...process.env, DSH_ICON: icoPath } })
+    .then((res) => {
+      try { fs.unlinkSync(scriptPath); } catch { /* 忽略 */ }
+      return res;
+    });
 }
 
 // 应用退出后（exe 解锁后）由分离的 PowerShell 助手打 exe 图标补丁。
+// 全文件唯一允许 detached:true 的 spawn（铁律 #8）；脚本走临时文件 + -File。
+// 不删除临时文件：助手在应用退出后运行（先 Sleep 5s），仍需要读取脚本文件。
 function spawnExePatch(exePath, icoPath, rcedit) {
   const ps = [
     'Start-Sleep -Seconds 5',
@@ -560,7 +583,11 @@ function spawnExePatch(exePath, icoPath, rcedit) {
     '  & $rcedit $exe --set-icon $ico',
     '}',
   ].join('\n');
-  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+  const scriptPath = path.join(process.env.TEMP || '.', 'dsh-exe-patch-' + process.pid + '.ps1');
+  try {
+    fs.writeFileSync(scriptPath, '\uFEFF' + ps, 'utf8');
+  } catch { return; } // 图标补丁失败不阻塞退出
+  const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-File', scriptPath], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
@@ -638,7 +665,27 @@ async function doApplyIcon() {
   return { steps };
 }
 
-ipcMain.handle('settings:apply-icon', () => doApplyIcon());
+/* ------------------------------------------------------------------ */
+/* IPC 调用方校验（安全加固）                                           */
+/* ------------------------------------------------------------------ */
+
+// 执行类 IPC 一律先校验调用方：只接受主窗口（加载 dsh 本地页面）发来的调用。
+// 即使内核页面被注入脚本，也把可触达的执行面收敛到本窗口、本来源（127.0.0.1/localhost）。
+function isTrustedSender(event) {
+  try {
+    if (!event || !event.sender || !event.senderFrame) return false;
+    if (mainWindow && !mainWindow.isDestroyed() && event.sender !== mainWindow.webContents) return false;
+    const u = new URL(String(event.senderFrame.url || ''));
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+  } catch { return false; }
+}
+
+const IPC_DENIED = { ok: false, error: '拒绝：未受信任的调用来源' };
+
+ipcMain.handle('settings:apply-icon', (event) => {
+  if (!isTrustedSender(event)) return IPC_DENIED;
+  return doApplyIcon();
+});
 
 /* 更新：壳 + dsh 内核双通道，一个按钮一起处理 --------------------------- */
 
@@ -688,6 +735,37 @@ function normalizeVersion(v) {
   return String(v || '').trim().replace(/^[~^<>= ]+/, '');
 }
 
+// 本地构建通道前置检查：npm 是否可用（Windows 下 npm 是 .cmd，经 cmd /c 探测）。
+function toolchainAvailable() {
+  try {
+    const isWin = process.platform === 'win32';
+    const r = spawnSync(isWin ? 'cmd.exe' : 'npm', isWin ? ['/c', 'npm.cmd --version'] : ['--version'], {
+      windowsHide: true,
+      stdio: 'ignore',
+      timeout: 15000,
+    });
+    return r.status === 0 && !r.error;
+  } catch { return false; }
+}
+
+// 实际安装/运行中的 dsh 内核版本：打包版 = 应用安装目录（__dirname = resources/app，
+// launchDsh 正是从这里 resolve 内核 bin）捆绑的那份；开发模式 __dirname 即项目目录，
+// 与项目 node_modules 相同。读不到时回退项目 node_modules（离线/目录不完整场景），
+// 再读不到返回 null（调用方视为"未知"，不据此误判可升级）。
+function getInstalledDshVersion() {
+  const candidates = [
+    path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+    path.join(getProjectDir(), 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+  ];
+  for (const f of candidates) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (pkg.version) return pkg.version;
+    } catch { /* 尝试下一个 */ }
+  }
+  return null;
+}
+
 // 安装包文件名比较：按版本号数值排序。不能用默认字典序——"0.1.10" 会排在
 // "0.1.9" 前面，取"最后一个"时总是选到旧版安装包（本地通道永远装不上新版本）。
 function compareSetupVersions(a, b) {
@@ -709,10 +787,8 @@ function getUpdateInfo() {
     info.shellVersion = pkg.version;
     info.dshPinned = (pkg.dependencies && pkg.dependencies['@deepseek-ai/dsh']) || null;
   } catch { /* 目录无效 */ }
-  try {
-    const dshPkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'));
-    info.dshInstalled = dshPkg.version;
-  } catch { /* 未安装 */ }
+  // 实际安装/运行中的 dsh 内核版本（打包版 = 应用安装目录捆绑的内核，开发模式 = 项目 node_modules）
+  info.dshInstalled = getInstalledDshVersion();
   try {
     const distDir = path.join(projectDir, 'dist');
     const files = fs.readdirSync(distDir).filter((f) => /^DeepSeek Harness Setup .*\.exe$/i.test(f));
@@ -727,8 +803,11 @@ function sendUpdateLog(msg) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('settings:update-log', msg);
 }
 
-async function runUpdate({ projectDir, upgradeDsh }) {
-  if (!projectDir || !fs.existsSync(path.join(projectDir, 'package.json'))) {
+async function runUpdate({ upgradeDsh }) {
+  // 项目目录是单一事实来源（配置默认值或 DSH_PROJECT_DIR），不接受渲染层传入的路径——
+  // 否则设置卡片输入框可以指到任意目录，让主进程在攻击者可控的 package.json 上执行 npm 脚本。
+  const projectDir = getProjectDir();
+  if (!fs.existsSync(path.join(projectDir, 'package.json'))) {
     return { ok: false, error: '项目目录无效或缺少 package.json：' + projectDir };
   }
   sendUpdateLog('[更新] 项目目录：' + projectDir);
@@ -738,15 +817,22 @@ async function runUpdate({ projectDir, upgradeDsh }) {
   sendUpdateLog('[更新] 壳（本地源码 vs 已安装）：' + (shellChanged ? '有改动，可更新' : '已是最新'));
   let dshLatest = null;
   let dshNeedsUpdate = false;
-  const pinned = getUpdateInfo().dshPinned || '?';
+  const updateInfo = getUpdateInfo();
+  const pinned = updateInfo.dshPinned || '?';
+  const installedDsh = updateInfo.dshInstalled;
   if (upgradeDsh) {
     dshLatest = await checkDshLatest();
     if (!dshLatest) {
       sendUpdateLog('[更新][WARN] 无法查询 dsh 最新版本（可能离线），按当前锁定版本继续。');
     } else {
       // 去掉 package.json 里的 semver 范围前缀（^ ~ > < = 等）再比较，避免“^0.1.0-rc.6 != 0.1.0-rc.6”误报可升级
-      dshNeedsUpdate = dshLatest !== normalizeVersion(pinned);
-      sendUpdateLog('[更新] dsh 内核：当前锁定 ' + pinned + '，npm 最新 ' + dshLatest + (dshNeedsUpdate ? ' → 可升级' : ' → 已是最新'));
+      // 盲区修复：不仅对比「源码锁定版本」，还对比「实际安装/运行中的内核版本」——
+      // 源码锁定已是 npm 最新、但应用安装目录仍捆绑旧内核时，必须判为可升级（触发重装），
+      // 否则会误报"已是最新"、跳过更新，运行中的内核永远是旧的。
+      const pinnedUpToDate = dshLatest === normalizeVersion(pinned);
+      const installedUpToDate = !installedDsh || dshLatest === normalizeVersion(installedDsh);
+      dshNeedsUpdate = !pinnedUpToDate || !installedUpToDate;
+      sendUpdateLog('[更新] dsh 内核：源码锁定 ' + pinned + '，已安装 ' + (installedDsh || '未知') + '，npm 最新 ' + dshLatest + (dshNeedsUpdate ? ' → 可升级' : ' → 已是最新'));
     }
   }
 
@@ -758,6 +844,15 @@ async function runUpdate({ projectDir, upgradeDsh }) {
     return { ok: true, upToDate: true, message: msg };
   }
 
+  // —— 本地构建通道前置检查：需要开发机工具链（node/npm；koffi 重编译还要编译工具链）。
+  // 打包版在普通用户机器上大概率没有 npm，这里先探测并给出明确错误，而不是在
+  // npm install / npm run dist 里挂掉。 ——
+  if (!toolchainAvailable()) {
+    const msg = '本地构建更新需要 Node.js/npm 工具链（koffi 重编译还需要编译工具链）。未检测到 npm，请先安装 Node.js >= 18 后重试，或改用已发布的更新通道。';
+    sendUpdateLog('[更新][ERR] ' + msg);
+    return { ok: false, error: msg };
+  }
+
   // —— 内核升级（可选） ——
   if (upgradeDsh && dshNeedsUpdate) {
     sendUpdateLog('[更新] 正在升级 dsh 内核到最新版（npm install @deepseek-ai/dsh@latest）…');
@@ -765,7 +860,7 @@ async function runUpdate({ projectDir, upgradeDsh }) {
     if (up.ok) {
       sendUpdateLog('[更新] dsh 内核已升级。');
     } else {
-      sendUpdateLog('[更新][WARN] dsh 升级失败，继续用当前锁定版本打包：' + ((up.err || up.error || '') + '').trim());
+      sendUpdateLog('[更新][WARN] dsh 升级失败，继续用当前锁定版本打包：' + ((up.err || up.error || '') + '').trim() + '（常见原因：离线、npm 源不可达，或缺少编译 koffi 的构建工具链）');
     }
   } else if (upgradeDsh) {
     sendUpdateLog('[更新] dsh 已是 npm 最新版，无需升级。');
@@ -799,13 +894,6 @@ async function runUpdate({ projectDir, upgradeDsh }) {
 //   杀全部进程（含逃逸的 dsh node）→ 删安装目录 → 清注册表 → 静默装新版 → 自动重启。
 // 与手动修复脚本 fix-install-v2 同逻辑（已实测通过）；安装器面对全新状态，
 // 不会触发"卸载旧版"路径，"无法关闭 / exit 2" 结构性消失。
-// 由分离的 PowerShell 助手执行（根本性修复 v0.1.3）：
-// 不再依赖 electron-builder 的"旧卸载器"流程——旧卸载器在本机反复非零退出
-// （安装器 exit 2 / 重试后弹"无法关闭"），其依赖（注册表状态、进程彻底死透、
-// 无残留锁文件）任一不满足就失败。改为彻底清理后全新安装：
-//   杀全部进程（含逃逸的 dsh node）→ 删安装目录 → 清注册表 → 静默装新版 → 自动重启。
-// 与手动修复脚本 fix-install-v2 同逻辑（已实测通过）；安装器面对全新状态，
-// 不会触发"卸载旧版"路径，"无法关闭 / exit 2" 结构性消失。
 //
 // 助手脚本本体在 assets/install-helper.ps1（可读可查可单测的独立文件），参数走
 // 环境变量（DSH_INSTALLER / DSH_DIR / DSH_NEWEXE / DSH_LOG），不再在 JS 里拼
@@ -822,7 +910,9 @@ function installAndQuit(installer) {
   // 写临时 .ps1 文件（加 UTF-8 BOM，保证 PowerShell 5.1 正确解析中文 UI 文案）
   const ps1 = path.join(process.env.TEMP || '.', 'dsh-install.ps1');
   try {
-    const ps = fs.readFileSync(path.join(__dirname, 'assets', 'install-helper.ps1'), 'utf8');
+    // 仓库文件本身带 UTF-8 BOM（PS 5.1 解析中文需要）；Node readFileSync 不会剥 BOM，
+    // 这里先剥掉再统一补一个，避免双重 BOM 让脚本开头变成 ZWNBSP 导致解析失败。
+    const ps = fs.readFileSync(path.join(__dirname, 'assets', 'install-helper.ps1'), 'utf8').replace(/^\uFEFF/, '');
     fs.writeFileSync(ps1, '\uFEFF' + ps, 'utf8');
   } catch (e) {
     sendUpdateLog('[更新][ERR] 写入安装脚本失败：' + ((e && e.message) || String(e)));
@@ -835,7 +925,17 @@ function installAndQuit(installer) {
   // 写临时 .cmd 批处理（必须 CRLF，LF 会被 cmd 解析破坏）
   const cmdPath = path.join(process.env.TEMP || '.', 'dsh-install.cmd');
   const cmdBody = '@echo off\r\nstart "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ps1 + '"\r\n';
-  try { fs.writeFileSync(cmdPath, cmdBody, 'utf8'); } catch (e) { sendUpdateLog('[更新][ERR] 写入安装批处理失败：' + ((e && e.message) || String(e))); }
+  try {
+    fs.writeFileSync(cmdPath, cmdBody, 'utf8');
+  } catch (e) {
+    // 与 .ps1 写失败同样处理：abort——继续 spawn 一个不存在的批处理只会"点了更新没反应"。
+    sendUpdateLog('[更新][ERR] 写入安装批处理失败：' + ((e && e.message) || String(e)));
+    log('error', 'install-helper: 写入安装批处理失败 ' + ((e && e.message) || String(e)));
+    quitting = true;
+    stopDsh();
+    app.quit();
+    return;
+  }
   const child = spawn('cmd.exe', ['/c', cmdPath], {
     // 注意：不要 detached:true（会让 powershell 启动即死）；cmd /c start 已实现脱离
     stdio: 'ignore',
@@ -858,8 +958,15 @@ function installAndQuit(installer) {
   }, 2500);
 }
 
-ipcMain.handle('settings:get-update-info', () => getUpdateInfo());
-ipcMain.handle('settings:run-update', (_e, args) => runUpdate(args || {}));
+ipcMain.handle('settings:get-update-info', (event) => {
+  if (!isTrustedSender(event)) return null;
+  return getUpdateInfo();
+});
+ipcMain.handle('settings:run-update', (event, args) => {
+  if (!isTrustedSender(event)) return IPC_DENIED;
+  // 项目目录由配置决定（getProjectDir），渲染层只允许表达"是否升级 dsh 内核"。
+  return runUpdate({ upgradeDsh: !!(args && args.upgradeDsh) });
+});
 
 /* ------------------------------------------------------------------ */
 /* 真实自动更新（electron-updater，壳通道）                               */
@@ -932,9 +1039,13 @@ async function checkRealUpdate() {
   }
 }
 
-ipcMain.handle('update:check', () => checkRealUpdate());
+ipcMain.handle('update:check', (event) => {
+  if (!isTrustedSender(event)) return { mode: 'error', error: '拒绝：未受信任的调用来源' };
+  return checkRealUpdate();
+});
 
-ipcMain.handle('update:download', async () => {
+ipcMain.handle('update:download', async (event) => {
+  if (!isTrustedSender(event)) return IPC_DENIED;
   if (!autoUpdater) return { ok: false, error: 'electron-updater 未加载' };
   try {
     await autoUpdater.downloadUpdate();
@@ -953,7 +1064,9 @@ function findDownloadedInstaller() {
   try {
     const cacheDir = path.join(process.env.LOCALAPPDATA || '', 'deepseek-harness-desktop-updater', 'pending');
     if (!fs.existsSync(cacheDir)) return null;
-    const files = fs.readdirSync(cacheDir).filter((f) => /^DeepSeek-Harness-Setup-.*\.exe$/i.test(f));
+    // 兼容连字符/空格两种命名（发布资产用连字符，本地 dist 用空格）：命名变化时
+    // 不要静默失效成"未找到已下载的安装包"。
+    const files = fs.readdirSync(cacheDir).filter((f) => /^DeepSeek[- ]+Harness[- ]+Setup[- ]+[^/\\]+\\.exe$/i.test(f));
     if (!files.length) return null;
     files.sort(compareSetupVersions);
     const p = path.join(cacheDir, files[files.length - 1]);
@@ -961,7 +1074,8 @@ function findDownloadedInstaller() {
   } catch { return null; }
 }
 
-ipcMain.handle('update:quit-install', () => {
+ipcMain.handle('update:quit-install', (event) => {
+  if (!isTrustedSender(event)) return IPC_DENIED;
   // 根本性修复：只走"干净状态静默安装"（installAndQuit：杀进程→清注册表→删目录→
   // 装新版→重启），彻底绕开 electron-updater 的 quitAndInstall 及其触发的旧卸载器
   // 流程（旧卸载器失败 → exit 2 / "无法关闭"）。找不到安装包就明确报错，绝不回退旧流程。
@@ -977,7 +1091,8 @@ ipcMain.handle('update:quit-install', () => {
 
 // 内核主题同步：web 页面报告实际主题（深/浅），让 Windows 标题栏等原生 UI 跟随，
 // 与内核外观保持一致。原生菜单已移除（Menu.setApplicationMenu(null)）。
-ipcMain.on('shell:theme', (_event, isDark) => {
+ipcMain.on('shell:theme', (event, isDark) => {
+  if (!isTrustedSender(event)) return;
   try {
     nativeTheme.themeSource = isDark ? 'dark' : 'light';
   } catch { /* 忽略 */ }
@@ -988,6 +1103,7 @@ ipcMain.on('shell:theme', (_event, isDark) => {
 /* ------------------------------------------------------------------ */
 
 async function bootstrap() {
+  log('info', 'dsh 内核版本：' + (getInstalledDshVersion() || '未知（未安装）'));
   createTray();
   await launchDsh();
 }
@@ -1000,6 +1116,9 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // Windows 通知/托盘气泡需要 AppUserModelID（Win10+ 上无它托盘气泡可能不显示）。
+  app.setAppUserModelId('com.deepseekharness.desktop');
+
   app.on('second-instance', (_event, argv) => {
     // 开机自启（--hidden）撞上已在运行的实例时保持静默，不打扰。
     if (argv.includes('--hidden')) return;

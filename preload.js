@@ -237,7 +237,7 @@ function injectUpdateCardInto(dialog, container) {
   <p class="ver" data-ver>读取中…</p>
   <div class="field">
     <label>本地源码项目目录</label>
-    <input type="text" data-project spellcheck="false" />
+    <input type="text" data-project spellcheck="false" readonly title="项目目录由配置决定（DSH_PROJECT_DIR 或默认值），不在此修改" />
   </div>
   <label class="check"><input type="checkbox" data-upgrade-dsh /> 同时升级 dsh 内核到最新版（默认不勾，保守）</label>
   <div class="row">
@@ -306,8 +306,8 @@ function injectUpdateCardInto(dialog, container) {
         appendLog('[WARN] 真实更新通道检查失败：' + check.error + '，回退本地构建更新。', '#f5a623');
       }
       // 2) 本地构建更新（开发模式 / 未发布场景）
+      // 项目目录由主进程配置决定（getProjectDir / DSH_PROJECT_DIR），渲染层不传路径。
       const r = await ipcRenderer.invoke('settings:run-update', {
-        projectDir: (projEl.value || '').trim(),
         upgradeDsh: chkEl.checked,
       });
       if (r && r.ok) {
@@ -405,8 +405,17 @@ function ensureCards() {
   }
 }
 
+let observerTimer = null;
 function startObserver() {
-  const observer = new MutationObserver(() => ensureCards());
+  const observer = new MutationObserver(() => {
+    // 聊天流式渲染下 DOM 变更极高频：合并到 ~100ms 内跑一次 ensureCards，
+    // 避免每次变更都做全文档 querySelectorAll（长会话大 DOM 下会卡）。
+    if (observerTimer) return;
+    observerTimer = setTimeout(() => {
+      observerTimer = null;
+      ensureCards();
+    }, 100);
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   ensureCards();
 }

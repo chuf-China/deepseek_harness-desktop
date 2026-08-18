@@ -240,6 +240,12 @@ function findSkillByName(name) {
 /* 写操作（新建/编辑/删除）                                             */
 /* ------------------------------------------------------------------ */
 
+// 整文件模式的 frontmatter 是否闭合（首行 --- 且存在收尾 ---）：
+// 不闭合就写盘会生成"面板读不到 name、内核丢弃"的隐形技能文件。
+function hasClosedFrontmatter(text) {
+  return /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.test(String(text || '').trimStart());
+}
+
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const NAME_MAX = 64;
 const NAME_RESERVED = new Set(['runtime']);
@@ -276,13 +282,22 @@ function createSkill(name, body) {
   if (fs.existsSync(file) || fs.existsSync(dir)) {
     return { ok: false, error: '同名技能已存在：' + name };
   }
+  // 整文件模式：body 以 --- 开头（面板发完整 SKILL.md）→ 原样写入；
+  // 否则按纯正文走模板（buildSkillFile）。frontmatter 未闭合时拒绝写入，
+  // 避免生成"面板看不到、内核也不认"的隐形技能文件；校验必须在 mkdir 之前，
+  // 否则拒绝时也会留下一个空目录（下次创建同名技能会误报"已存在"）。
+  const incoming = String(body || '');
+  let content;
+  if (incoming.trimStart().startsWith('---')) {
+    if (!hasClosedFrontmatter(incoming)) {
+      return { ok: false, error: 'SKILL.md frontmatter 不完整（缺少闭合的 --- 行）' };
+    }
+    content = incoming;
+  } else {
+    content = buildSkillFile(name, body);
+  }
   try {
     fs.mkdirSync(dir, { recursive: true });
-    // 整文件模式：body 以 --- 开头（面板发完整 SKILL.md）→ 原样写入；
-    // 否则按纯正文走模板（buildSkillFile）。
-    const content = String(body || '').trimStart().startsWith('---')
-      ? String(body || '')
-      : buildSkillFile(name, body);
     fs.writeFileSync(file, content, 'utf8');
   } catch (e) {
     return { ok: false, error: '写入失败：' + e.message };
@@ -297,6 +312,9 @@ function updateSkill(name, body) {
   if (item.readonly) return { ok: false, error: '内置预设技能为只读，不能修改' };
   try {
     const incoming = String(body || '');
+    if (incoming.trimStart().startsWith('---') && !hasClosedFrontmatter(incoming)) {
+      return { ok: false, error: 'SKILL.md frontmatter 不完整（缺少闭合的 --- 行）' };
+    }
     const parsed = parseFrontmatter(incoming);
     let content;
     if (parsed.hasFrontmatter) {
@@ -336,8 +354,20 @@ function deleteSkill(name) {
 /* IPC（electron 环境下自动注册）                                       */
 /* ------------------------------------------------------------------ */
 
+// IPC 调用方校验：只接受 dsh 本地页面（127.0.0.1/localhost）发来的调用。
+// 与 main.js 的 isTrustedSender 同策略（skills.js 可独立运行，故各自实现一份）。
+function isTrustedSender(event) {
+  try {
+    const url = event && event.senderFrame && event.senderFrame.url;
+    if (!url) return false;
+    const u = new URL(url);
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost';
+  } catch { return false; }
+}
+
 function registerSkillsIpc() {
-  ipcMain.handle('skills:list', () => {
+  ipcMain.handle('skills:list', (event) => {
+    if (!isTrustedSender(event)) return { ok: false, error: '拒绝：未受信任的调用来源' };
     try {
       const roots = skillRoots();
       return {
@@ -350,10 +380,20 @@ function registerSkillsIpc() {
       return { ok: false, error: e.message };
     }
   });
-  ipcMain.handle('skills:create', (_e, name, body) => createSkill(name, body));
-  ipcMain.handle('skills:update', (_e, name, body) => updateSkill(name, body));
-  ipcMain.handle('skills:delete', (_e, name) => deleteSkill(name));
-  ipcMain.handle('skills:open-folder', (_e, name) => {
+  ipcMain.handle('skills:create', (event, name, body) => {
+    if (!isTrustedSender(event)) return { ok: false, error: '拒绝：未受信任的调用来源' };
+    return createSkill(name, body);
+  });
+  ipcMain.handle('skills:update', (event, name, body) => {
+    if (!isTrustedSender(event)) return { ok: false, error: '拒绝：未受信任的调用来源' };
+    return updateSkill(name, body);
+  });
+  ipcMain.handle('skills:delete', (event, name) => {
+    if (!isTrustedSender(event)) return { ok: false, error: '拒绝：未受信任的调用来源' };
+    return deleteSkill(name);
+  });
+  ipcMain.handle('skills:open-folder', (event, name) => {
+    if (!isTrustedSender(event)) return { ok: false, error: '拒绝：未受信任的调用来源' };
     const item = findSkillByName(name);
     if (!item) return { ok: false, error: '未找到技能：' + name };
     try {
@@ -377,6 +417,7 @@ module.exports = {
   userSkillDir,
   parseFrontmatter,
   parseBool,
+  hasClosedFrontmatter,
   scanSkills,
   findSkillByName,
   createSkill,

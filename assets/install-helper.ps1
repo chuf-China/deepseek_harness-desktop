@@ -1,4 +1,4 @@
-# DeepSeek Harness 安装助手（由 main.js 的 installAndQuit 调用）。
+﻿# DeepSeek Harness 安装助手（由 main.js 的 installAndQuit 调用）。
 #
 # 铁律 #8：不能直接 spawn detached:true 的 powershell（Windows 下启动即死）；必须
 # 由 main.js 把本文件写入 %TEMP%\dsh-install.ps1（加 UTF-8 BOM，中文在 PowerShell
@@ -90,9 +90,14 @@ try {
     Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object {
       try {
         $p = Get-ItemProperty $_.PSPath -ErrorAction Stop
-        if ($p.DisplayName -like '*DeepSeek*') {
+        # 精确匹配本产品（DisplayName 或 UninstallString 指向安装目录），绝不宽匹配
+        # '*DeepSeek*'——那会误删同机其它 DeepSeek 产品的卸载项（如官方桌面应用），
+        # 造成它们无法卸载/更新（孤儿安装）。
+        $isOurs = ($p.DisplayName -eq 'DeepSeek Harness') -or
+                  ($p.UninstallString -and ($p.UninstallString -like ('*' + $dir + '*')))
+        if ($isOurs) {
           Remove-Item $_.PSPath -Recurse -Force
-          Write-Log ('removed-reg: ' + $_.PSPath)
+          Write-Log ('removed-reg: ' + $_.PSPath + ' DisplayName=' + $p.DisplayName)
         }
       } catch { }
     }
@@ -150,11 +155,12 @@ try {
     Set-UI ('安装失败（安装器退出码: ' + $code + '），请查看 ' + $LOG) 100
     Start-Sleep -Seconds 8
     try { $script:ui.Close() } catch { }
-    Start-Process -FilePath $newExe -ErrorAction SilentlyContinue
+    # 失败时新 exe 通常不存在/是旧版，不强行拉起（避免误导用户以为装好了）
+    if (Test-Path $newExe) { Start-Process -FilePath $newExe }
   }
 } catch {
-  # 兜底：任何一步抛错都落盘、关 UI、尝试拉起应用，别让用户卡在无声窗口
+  # 兜底：任何一步抛错都落盘、关 UI，别让用户卡在无声窗口；仅当新 exe 存在才拉起
   Write-Log ("install-helper error: " + $_.Exception.Message)
   try { if ($script:ui) { $script:ui.Close() } } catch { }
-  Start-Process -FilePath $newExe -ErrorAction SilentlyContinue
+  if (Test-Path $newExe) { Start-Process -FilePath $newExe -ErrorAction SilentlyContinue }
 }
