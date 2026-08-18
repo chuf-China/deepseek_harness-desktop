@@ -151,7 +151,7 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
    `chuf-China/deepseek_harness-desktop`，`releaseType: "release"`——顶层 `publish`
    在构建时被忽略，必须放 `build.publish`，见 452274c）。发布流程 = 推 `v*` tag →
    CI 自动打包 → 上传 Release（`latest.yml` + 安装包 + blockmap）；当前最新发布
-   **v0.1.10**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
+   **v0.1.11**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
    （`shellHasChanges()`=true）时回退本地构建更新（`npm run dist` + installAndQuit，
    同样弹安装进度窗）。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。
