@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "DeepSeek Harness 桌面壳（Electron）：启动本地 dsh，开窗口指向其 web UI，系统托盘，退出回收子进程。壳核分离，内核不 vendor。",
   "main": "main.js",
   "scripts": {
