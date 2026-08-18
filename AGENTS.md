@@ -43,13 +43,17 @@ main.js (Electron 主进程)
   │         重启；起 %TEMP%\dsh-install.ps1（UTF-8 BOM）+ .cmd（CRLF）执行，
   │         WinForms 进度窗（v0.1.8），成败按安装器退出码判定（详见铁律 #8/#9）
   ├─ 退出时 exe 图标补丁：spawnExePatch（全文件唯一允许 detached:true 的 spawn）
+  ├─ IPC 安全：执行类 IPC（settings:* / update:* / skills:*）先过 isTrustedSender
+  │    校验（只接受主窗口 127.0.0.1/localhost 页面）；项目目录由配置决定，渲染层不传路径
   └─ 退出：Windows 用 taskkill /pid <dsh> /T /F 回收整棵子进程树
 ```
 
 ## 铁律（不可破坏的约束，改代码时逐条核对）
 
 1. **壳核分离，内核不 vendor**：`@deepseek-ai/dsh` 只作为 npm 依赖存在（当前锁定
-   `0.1.0-rc.6`），绝不把内核代码拷进本仓库。升级 = 改 `package.json` 版本号。
+   `0.1.0-rc.7`，**精确版本、无范围前缀**，锁定期望由 package.json + lockfile 双重
+   保证；caret 范围会静默允许 0.1.x 稳定版，不要用），绝不把内核代码拷进本仓库。
+   升级 = 改 `package.json` 版本号。
 2. **必须用标准 node 跑 dsh（优先捆绑的 sidecar）**：dsh 的 native 依赖
    （node-pty / koffi）按标准 node ABI 编译，Electron 内置 node 的 ABI 不匹配，
    **不要用 `ELECTRON_RUN_AS_NODE`**。`findNode()`：打包版优先
@@ -93,7 +97,7 @@ main.js (Electron 主进程)
 
 ```powershell
 # 开发模式
-npm install
+npm install          # postinstall 会本地重编译 koffi native 绑定，需要 VS Build Tools
 npm start            # electron . 启动壳
 
 # 打包（electron-builder → NSIS 安装包，输出到 dist/）
@@ -177,8 +181,10 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 - **双通道判定**：`shellHasChanges()` 比较源码与安装目录的 main.js、preload.js、
   assets/icon.ico、icon.png、tray.png、icon.svg 六个文件（**不比** package.json、
   skills.js）——全同步走真实 GitHub 通道；不同步则更新卡片走本地构建通道
-  （`npm run dist` + installAndQuit）。开发时把源码同步进安装目录可让本地通道
-  变真实通道。
+  （`npm run dist` + installAndQuit）。本地通道需要开发机工具链（node/npm/编译链），
+  `runUpdate` 会先探测 npm，缺失时明确报错；设置卡片里的项目目录为只读显示，
+  由 `DSH_PROJECT_DIR` 或默认值决定（渲染层不传路径）。开发时把源码同步进安装
+  目录可让本地通道变真实通道。
 - **安装器退出码 2 / "无法关闭"** = 旧卸载器流程被触发；正解是先清注册表再删目录
   （铁律 #9），不是加等待/重试。手动安装场景（双击安装包）的"无法关闭"根因是
   **残留的 dsh node 侧车**（崩溃/重启后的孤儿进程，映像名 node.exe 不在应用名下，

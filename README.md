@@ -28,7 +28,9 @@
 
 ## 前置要求
 
-- 开发模式：Node.js >= 18（dsh 是 Node 应用）+ npm
+- 开发模式：Node.js >= 18（dsh 是 Node 应用）+ npm；`npm install` 的 postinstall 会
+  本地重编译 koffi native 绑定，**需要 C++ 构建工具链**（Windows 下为 VS Build
+  Tools；没有工具链时 `npm install` 会失败）
 - 打包版：**无需装 Node** —— 安装包已捆绑标准 node（`resources/node/node.exe`，与系统 node 同 ABI）
 
 ## 运行（开发模式）
@@ -65,7 +67,10 @@ npm run dist
 
 - **壳通道**：已发布场景走 `electron-updater`（检查 → 下载 → 退出静默安装）；
 - **dsh 内核通道**：npm 上 dsh 有新版时，在本地构建流程里一并升级重打包；
-- 未发布 / 开发模式自动回退“本地构建更新”（`npm run dist` + 自动安装）。
+- 未发布 / 开发模式自动回退“本地构建更新”（`npm run dist` + 自动安装）。本地通道
+  需要开发机工具链（node/npm，koffi 重编译还需编译工具链）：主进程会先探测 npm，
+  缺失时明确报错而不是挂掉；设置卡片里的项目目录为只读显示（由 `DSH_PROJECT_DIR`
+  或默认值决定，不在 UI 修改）。
 
 发布到 GitHub Releases 的步骤：
 
