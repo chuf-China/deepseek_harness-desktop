@@ -39,6 +39,10 @@ main.js (Electron 主进程)
   │    │    不依赖 update-downloaded 事件时序）→ installAndQuit()
   │    ├─ 本地/开发通道：shellHasChanges()=true（源码与安装目录不同步）→
   │    │    npm run dist → installAndQuit()
+  │    │    dsh 内核通道：查 npm dist-tags 取所有 tag 的最大版本（deepseek-ai 的
+  │    │    新 rc 先发 next、latest 转正才推进——用 npm view ... version 只会读到
+  │    │    latest，会漏掉新 rc 误报"已是最新"），升级按确切版本
+  │    │    npm install @deepseek-ai/dsh@<版本> --save-exact（禁止 @latest）
   │    └─ installAndQuit()：杀进程 → 清注册表 → 删目录(3 段兜底) → 静默装新 →
   │         重启；起 %TEMP%\dsh-install.ps1（UTF-8 BOM）+ .cmd（CRLF）执行，
   │         WinForms 进度窗（v0.1.8），成败按安装器退出码判定（详见铁律 #8/#9）
@@ -151,7 +155,7 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
    `chuf-China/deepseek_harness-desktop`，`releaseType: "release"`——顶层 `publish`
    在构建时被忽略，必须放 `build.publish`，见 452274c）。发布流程 = 推 `v*` tag →
    CI 自动打包 → 上传 Release（`latest.yml` + 安装包 + blockmap）；当前最新发布
-   **v0.1.11**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
+   **v0.1.12**（每次发布新版本时顺手更新此数字）。未发布/源码与安装目录不同步
    （`shellHasChanges()`=true）时回退本地构建更新（`npm run dist` + installAndQuit，
    同样弹安装进度窗）。
 3. **端口竞态**：`findFreePort()` 选的端口在 dsh bind 前极小概率被抢，未做重试。
@@ -167,6 +171,30 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
    极简实现，语义以内核 `dsh-skill-filesystem` README 为准（非法策略值 → 面板
    标 invalid，与内核"丢弃该技能"对齐）；实时感知依赖内核 Chokidar watcher，
    极端未触发时面板可手动「刷新」。
+7. **主模型（deepseek 官方）无原生多模态，视觉能力 = vision 工具 + 本地推理引擎**
+   （vision 代理架构，2026-08 落地）：deepseek 官方端点只服务纯文本模型，dsh 按
+   模型目录声明的 `inputModalities` 门控图片输入，对官方模型声明 image 属
+   over-claim 会弄坏真实请求——所以正确做法是让主模型通过工具把"像素→文字"。
+   - **工具**：`vision`（截屏 source=screen / 读图 source=file），实现位于
+     `~/.dsh/profiles/web/vision-tool/`（**用户层，独立于应用内核**，内核升级
+     npm install 不会触碰它；仅当 dsh-tools API 破坏性变更时需跟进），注册于
+     `~/.dsh/profiles/web/cordis.patch.yml`（loader 的 baseUrl = profile 目录，
+     相对路径 name 直接可用）；配套技能 `~/.dsh/skills/vision/SKILL.md`。
+   - **引擎可配置**（config.engine）：`ollama`（默认，原生 /api/chat 的 images
+     字段——注意本机 Ollama 版本**不接受** content 数组格式，实测 400）|
+     `openai`（/v1/chat/completions + image_url 块，同一格式覆盖 llama.cpp
+     llama-server / vLLM（Windows 需 WSL 或容器）/ LM Studio / 云端网关，填
+     apiKey）。换引擎 = 改 cordis.patch.yml 里 vision-tool 的 config，重启生效。
+   - **模型池**：gemma4:12b（默认，**本机已拉取且就是视觉模型**——判断方法：
+     `~/.ollama/models/manifests/registry.ollama.ai/library/<tag>` 里 layers 是否
+     含 `projector` 层，有即视觉；qwen3:8b/qwen3.5:9b 无 projector 是纯文本）；
+     qwen3-vl:8b 备选（ollama pull + 改 model 一处）。
+   - **关键事实**：沙箱内的 bash/pwsh **连不上** 127.0.0.1:11434（curl 空返回，
+     已实测）——vision 必须由插件在内核进程内直接 fetch（与 dsh-tool-web 同机制）；
+     直连聊天路由（settings.yaml 的 `llm-pi-ai.providers.ollama`，defaultInput
+     [text,image]）走 OpenAI 兼容 /v1，模型选择器里可选中 gemma4:12b 粘贴图片
+     直接对话。截屏由插件 spawn PowerShell（SetProcessDPIAware + CopyFromScreen，
+     主屏全屏 MVP；RDP/锁屏会黑屏并报错）。
 
 ## 更新与安装排查要点
 
@@ -178,6 +206,14 @@ npm run dist           # 生成 dist\DeepSeek Harness Setup *.exe
 - **版本验证三件套**：安装目录 `package.json` 的 `version` / exe 文件版本
   （FileVersion）/ HKCU 卸载注册表 DisplayVersion 三者一致，才是真装上了（历史
   教训：只信更新卡片文本会误判"没更新"）。
+- **dsh 内核"最新版" ≠ npm 的 latest tag**：deepseek-ai 发布约定是"新 rc 先发到
+  `next` dist-tag，`latest` 滞后到转正才推进"（实测 rc.8 发布后 dist-tags =
+  `{"next":"0.1.0-rc.8","latest":"0.1.0-rc.7"}`，dsh-agent 等包同样如此）。
+  因此检查必须查 `npm view @deepseek-ai/dsh dist-tags --json` 取所有 tag 的最大
+  semver（`checkDshLatest`），**不要**用 `npm view ... version`（只读 latest，
+  会漏掉 next 上的新 rc、误报"已是最新"）；升级安装必须
+  `npm install @deepseek-ai/dsh@<确切版本> --save-exact`，**不要**用 `@latest`
+  （只解析 latest tag 会装回旧 rc，且会把锁版写成 ^ 范围破坏铁律 #1 精确锁版）。
 - **双通道判定**：`shellHasChanges()` 比较源码与安装目录的 main.js、preload.js、
   assets/icon.ico、icon.png、tray.png、icon.svg 六个文件（**不比** package.json、
   skills.js）——全同步走真实 GitHub 通道；不同步则更新卡片走本地构建通道

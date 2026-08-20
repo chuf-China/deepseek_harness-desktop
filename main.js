@@ -721,13 +721,58 @@ function shellHasChanges() {
   return false;
 }
 
+// 查询 npm 上 dsh 内核的最新版。注意：deepseek-ai 的发布约定是"新 rc 先发到
+// `next` dist-tag，`latest` 只在转正时推进"（实测 0.1.0-rc.8 发布后 dist-tags =
+// {"next":"0.1.0-rc.8","latest":"0.1.0-rc.7"}；dsh-agent 等包同样如此）。因此
+// `npm view ... version`（= latest tag）会永远漏掉 next 上的新 rc、误报"已是最新"，
+// 必须取所有 dist-tag 里的最大版本，并记录来源 tag 用于日志。返回 {version, tag} 或 null。
 async function checkDshLatest() {
   try {
-    const r = await runCaptured('cmd.exe', ['/c', 'npm.cmd view @deepseek-ai/dsh version --no-audit --no-fund'], { cwd: getProjectDir() });
+    const r = await runCaptured('cmd.exe', ['/c', 'npm.cmd view @deepseek-ai/dsh dist-tags --json --no-audit --no-fund'], { cwd: getProjectDir() });
     if (!r.ok) return null;
-    const lines = (r.out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    return lines.length ? lines[lines.length - 1] : null;
+    const text = (r.out || '');
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    const tags = JSON.parse(text.slice(start, end + 1));
+    let best = null;
+    let bestTag = null;
+    for (const [tag, v] of Object.entries(tags)) {
+      const ver = normalizeVersion(v);
+      if (!ver || !/^[\d.]+/.test(ver)) continue;
+      if (!best || compareSemver(ver, best) > 0) { best = ver; bestTag = tag; }
+    }
+    return best ? { version: best, tag: bestTag } : null;
   } catch { return null; }
+}
+
+// 最小 semver 比较（major.minor.patch + 预发布），用于跨 dist-tag 取最新版。
+// 规则：先比主/次/补丁数字；再比预发布标识——无预发布 > 有预发布（0.1.0 > 0.1.0-rc.9），
+// 同为预发布按点分段逐段比（数字段按数值、字母段按字典序，数字段 < 字母段；段更少者更大）。
+function compareSemver(a, b) {
+  const parse = (s) => {
+    const m = String(s).trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+    return m ? { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] ? m[4].split('.') : null } : null;
+  };
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return String(a).localeCompare(String(b));
+  for (const k of ['major', 'minor', 'patch']) {
+    if (pa[k] !== pb[k]) return pa[k] - pb[k];
+  }
+  if (!pa.pre && !pb.pre) return 0;
+  if (!pa.pre) return 1;
+  if (!pb.pre) return -1;
+  for (let i = 0; i < Math.max(pa.pre.length, pb.pre.length); i++) {
+    if (i >= pa.pre.length) return -1;
+    if (i >= pb.pre.length) return 1;
+    const xa = pa.pre[i], xb = pb.pre[i];
+    const na = /^\d+$/.test(xa), nb = /^\d+$/.test(xb);
+    if (na && nb) { const d = parseInt(xa, 10) - parseInt(xb, 10); if (d) return d; continue; }
+    if (na) return -1;
+    if (nb) return 1;
+    if (xa !== xb) return xa < xb ? -1 : 1;
+  }
+  return 0;
 }
 
 // 去掉 semver 范围前缀，取裸版本号用于比较（^0.1.0-rc.6 → 0.1.0-rc.6）。
@@ -803,7 +848,17 @@ function sendUpdateLog(msg) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('settings:update-log', msg);
 }
 
+// 防并发：一次只允许一个更新流程。重复点击会让两个 npm install 同时写
+// node_modules/package.json（npm 无锁），依赖树会被写坏。
+let updateInFlight = false;
+
 async function runUpdate({ upgradeDsh }) {
+  if (updateInFlight) {
+    sendUpdateLog('[更新][WARN] 已有更新流程在运行，请等待它完成（内核升级的 npm install 需要几分钟，界面静默属正常）。');
+    return { ok: false, error: '已有更新流程在运行' };
+  }
+  updateInFlight = true;
+  try {
   // 项目目录是单一事实来源（配置默认值或 DSH_PROJECT_DIR），不接受渲染层传入的路径——
   // 否则设置卡片输入框可以指到任意目录，让主进程在攻击者可控的 package.json 上执行 npm 脚本。
   const projectDir = getProjectDir();
@@ -821,10 +876,11 @@ async function runUpdate({ upgradeDsh }) {
   const pinned = updateInfo.dshPinned || '?';
   const installedDsh = updateInfo.dshInstalled;
   if (upgradeDsh) {
-    dshLatest = await checkDshLatest();
-    if (!dshLatest) {
+    const latest = await checkDshLatest();
+    if (!latest) {
       sendUpdateLog('[更新][WARN] 无法查询 dsh 最新版本（可能离线），按当前锁定版本继续。');
     } else {
+      dshLatest = latest.version;
       // 去掉 package.json 里的 semver 范围前缀（^ ~ > < = 等）再比较，避免“^0.1.0-rc.6 != 0.1.0-rc.6”误报可升级
       // 盲区修复：不仅对比「源码锁定版本」，还对比「实际安装/运行中的内核版本」——
       // 源码锁定已是 npm 最新、但应用安装目录仍捆绑旧内核时，必须判为可升级（触发重装），
@@ -832,7 +888,7 @@ async function runUpdate({ upgradeDsh }) {
       const pinnedUpToDate = dshLatest === normalizeVersion(pinned);
       const installedUpToDate = !installedDsh || dshLatest === normalizeVersion(installedDsh);
       dshNeedsUpdate = !pinnedUpToDate || !installedUpToDate;
-      sendUpdateLog('[更新] dsh 内核：源码锁定 ' + pinned + '，已安装 ' + (installedDsh || '未知') + '，npm 最新 ' + dshLatest + (dshNeedsUpdate ? ' → 可升级' : ' → 已是最新'));
+      sendUpdateLog('[更新] dsh 内核：源码锁定 ' + pinned + '，已安装 ' + (installedDsh || '未知') + '，npm 最新 ' + dshLatest + (latest.tag && latest.tag !== 'latest' ? '（dist-tag: ' + latest.tag + '）' : '') + (dshNeedsUpdate ? ' → 可升级' : ' → 已是最新'));
     }
   }
 
@@ -855,12 +911,18 @@ async function runUpdate({ upgradeDsh }) {
 
   // —— 内核升级（可选） ——
   if (upgradeDsh && dshNeedsUpdate) {
-    sendUpdateLog('[更新] 正在升级 dsh 内核到最新版（npm install @deepseek-ai/dsh@latest）…');
-    const up = await runCaptured('cmd.exe', ['/c', 'npm.cmd install @deepseek-ai/dsh@latest --no-audit --no-fund'], { cwd: projectDir, onLine: sendUpdateLog });
+    // 必须按检查到的确切版本安装：@latest 只解析 latest tag（新 rc 在 next 上时
+    // 会装回旧版），且会把锁版写成 ^ 范围（违反铁律 #1 精确锁版）。--save-exact 双保险。
+    sendUpdateLog('[更新] 正在升级 dsh 内核到最新版 ' + dshLatest + '（npm install @deepseek-ai/dsh@' + dshLatest + ' --save-exact）…');
+    // npm 在非终端（管道）环境下安装全程静默，只在一开始解析/下载整个 rc 依赖树
+    // （约 150 个包、上千次 registry 请求，视网络 2~15 分钟）结束时才打印汇总——
+    // 不提前说明，用户会把"正在工作"误判成"卡死"。
+    sendUpdateLog('[更新] npm 正在解析并下载整个 dsh 依赖树（约 150 个包，视网络 2~15 分钟），期间日志静默属正常，请勿重复点击「检查并更新」。');
+    const up = await runCaptured('cmd.exe', ['/c', 'npm.cmd install @deepseek-ai/dsh@' + dshLatest + ' --save-exact --no-audit --no-fund'], { cwd: projectDir, onLine: sendUpdateLog });
     if (up.ok) {
       sendUpdateLog('[更新] dsh 内核已升级。');
     } else {
-      sendUpdateLog('[更新][WARN] dsh 升级失败，继续用当前锁定版本打包：' + ((up.err || up.error || '') + '').trim() + '（常见原因：离线、npm 源不可达，或缺少编译 koffi 的构建工具链）');
+      sendUpdateLog('[更新][ERR] dsh 内核升级失败：' + ((up.err || up.error || '') + '').trim() + '。本次继续用当前锁定版本打包，装完后检查仍会提示可升级；常见原因：离线、npm 源不可达、缺少编译 koffi 的构建工具链。');
     }
   } else if (upgradeDsh) {
     sendUpdateLog('[更新] dsh 已是 npm 最新版，无需升级。');
@@ -885,6 +947,9 @@ async function runUpdate({ upgradeDsh }) {
   sendUpdateLog('[更新] 新安装包：' + info.installer);
   installAndQuit(info.installer);
   return { ok: true, autoInstall: true };
+  } finally {
+    updateInFlight = false;
+  }
 }
 
 // 由分离的 PowerShell 助手执行（根本性修复 v0.1.3）：

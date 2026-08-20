@@ -12,6 +12,9 @@
 - 真正退出时回收整棵 dsh 子进程树（Windows 用 `taskkill /T /F`）
 - 单实例锁（重复启动聚焦已有窗口）
 - 设置弹窗内的更新卡片（壳 + dsh 内核双通道）与「技能」面板（管理 SKILL.md）
+- **本地视觉（vision 代理）**：主模型为纯文本的 deepseek 官方模型时，通过
+  `vision` 工具 + 本机推理引擎（Ollama / llama.cpp / vLLM / LM Studio，引擎可配置）
+  获得看图/截屏/OCR 能力；详见 AGENTS.md「已知边界 #7」。
 
 ## 架构
 
@@ -66,7 +69,9 @@ npm run dist
 设置页（web 原生「通用设置」里的更新卡片）是**双通道一个按钮**；技能卡片在左侧「技能」分区展示：
 
 - **壳通道**：已发布场景走 `electron-updater`（检查 → 下载 → 退出静默安装）；
-- **dsh 内核通道**：npm 上 dsh 有新版时，在本地构建流程里一并升级重打包；
+- **dsh 内核通道**：npm 上 dsh 有新版时，在本地构建流程里一并升级重打包。
+  注意 deepseek-ai 的新 rc 先发在 npm 的 `next` dist-tag（`latest` 转正才推进），
+  检查取 dist-tags 里所有 tag 的最大版本、安装用 `@<确切版本>`，不要用 `@latest`；
 - 未发布 / 开发模式自动回退“本地构建更新”（`npm run dist` + 自动安装）。本地通道
   需要开发机工具链（node/npm，koffi 重编译还需编译工具链）：主进程会先探测 npm，
   缺失时明确报错而不是挂掉；设置卡片里的项目目录为只读显示（由 `DSH_PROJECT_DIR`

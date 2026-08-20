@@ -9,7 +9,7 @@
     "dist": "electron-builder"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.0-rc.7",
+    "@deepseek-ai/dsh": "0.1.0-rc.8",
     "electron-updater": "^6.6.2"
   },
   "devDependencies": {
